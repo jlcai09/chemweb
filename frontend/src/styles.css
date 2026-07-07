@@ -632,34 +632,70 @@ p {
   min-width: 0;
 }
 
-.path-input .el-input__wrapper,
-.canvas-file-path .el-input__wrapper {
-  min-height: 30px;
+/* ── Global: el-input-group append/prepend ── */
+/* Element Plus sets border-radius:0 on the input wrapper when an append/prepend
+   slot is present, and gives the slot container its own border + background.
+   We restore the input wrapper's full border-radius, make the slot container
+   transparent, and let the inner button carry its own rounded border instead. */
+
+.el-input-group--append > .el-input__wrapper,
+.el-input-group--prepend > .el-input__wrapper {
+  border-top-right-radius: var(--radius-control);
+  border-bottom-right-radius: var(--radius-control);
+  border-top-left-radius: var(--radius-control);
+  border-bottom-left-radius: var(--radius-control);
 }
 
-.path-input.el-input-group--append .el-input__wrapper,
-.canvas-file-path.el-input-group--append .el-input__wrapper {
+.el-input-group--append > .el-input__wrapper {
   border-top-right-radius: var(--radius-control);
   border-bottom-right-radius: var(--radius-control);
 }
 
-.path-input .el-input-group__append,
-.canvas-file-path .el-input-group__append {
+.el-input-group--prepend > .el-input__wrapper {
+  border-top-left-radius: var(--radius-control);
+  border-bottom-left-radius: var(--radius-control);
+}
+
+.el-input-group__append,
+.el-input-group__prepend {
   border: 0;
-  padding: 0 0 0 8px;
   background: transparent;
   box-shadow: none;
+  padding: 0 0 0 8px;
+}
+
+.el-input-group__prepend {
+  padding: 0 8px 0 0;
+}
+
+.el-input-group__append .el-button,
+.el-input-group__prepend .el-button {
+  margin: 0;
+  border: 1px solid rgba(148, 163, 184, 0.3);
+  border-radius: var(--radius-control);
+  background: rgba(255, 255, 255, 0.58);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.68);
+  color: var(--text-muted);
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.el-input-group__append .el-button:hover,
+.el-input-group__prepend .el-button:hover {
+  border-color: rgba(23, 107, 135, 0.3);
+  background: rgba(255, 255, 255, 0.78);
+  color: var(--accent);
+}
+
+/* Preserve existing path-input / canvas-file-path sizing */
+.path-input .el-input__wrapper,
+.canvas-file-path .el-input__wrapper {
+  min-height: 30px;
 }
 
 .path-input .el-input-group__append .el-button,
 .canvas-file-path .el-input-group__append .el-button {
   width: 40px;
   height: 30px;
-  margin: 0;
-  border: 1px solid rgba(148, 163, 184, 0.3);
-  border-radius: var(--radius-control);
-  background: rgba(255, 255, 255, 0.58);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.68);
 }
 
 .crumb-button {
@@ -4597,30 +4633,32 @@ button.context-menu-item {
   justify-self: start;
 }
 
-.settings-cache-clear-dialog.el-message-box {
-  width: min(440px, calc(100vw - 28px));
-  max-width: calc(100vw - 28px);
+/* Global message-box sizing - make all confirm/prompt dialogs auto-fit their content */
+.el-message-box {
+  width: fit-content !important;
+  min-width: 320px;
+  max-width: min(680px, calc(100vw - 32px));
 }
 
-.settings-cache-clear-dialog .el-message-box__content {
+.el-message-box .el-message-box__content {
   align-items: flex-start;
-  padding-right: 18px;
+  padding-right: 16px;
 }
 
-.settings-cache-clear-dialog .el-message-box__message {
+.el-message-box .el-message-box__message {
   min-width: 0;
   max-width: 100%;
 }
 
-.settings-cache-clear-dialog .el-message-box__message p {
+.el-message-box .el-message-box__message p {
   margin: 0;
-  white-space: normal;
+  white-space: pre-wrap;
   overflow-wrap: anywhere;
   word-break: break-word;
   line-height: 1.55;
 }
 
-.settings-cache-clear-dialog .el-message-box__btns {
+.el-message-box .el-message-box__btns {
   display: flex;
   flex-wrap: wrap;
   justify-content: flex-end;
@@ -4736,6 +4774,117 @@ button.context-menu-item {
   box-shadow: 0 0 0 1px var(--accent) inset,
               inset 0 1px 0 rgba(255, 255, 255, 0.8),
               var(--ring);
+}
+
+/* ── el-input-number control buttons ── */
+/* Element Plus positions increase/decrease buttons absolutely on top of the
+   input wrapper.  With our custom border-radius (12 px) the default rectangular
+   buttons clip the rounded corners.  We give the buttons a matching glass style
+   and correct outer border-radius so they follow the wrapper contour. */
+
+.el-input-number {
+  --el-input-number-controls-height: 15px;
+}
+
+.el-input-number__increase,
+.el-input-number__decrease {
+  background: rgba(255, 255, 255, 0.58);
+  border: 1px solid rgba(148, 163, 184, 0.3);
+  color: var(--text-muted);
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+  /* Override Element Plus absolute positioning insets so the button sits
+     flush with the wrapper's rounded border instead of overlapping it. */
+  top: 0;
+  bottom: 0;
+}
+
+/* Default layout: decrease=left, increase=right */
+.el-input-number__decrease {
+  border-radius: var(--radius-control) 0 0 var(--radius-control);
+  border-right: none;
+  left: 0;
+}
+
+.el-input-number__increase {
+  border-radius: 0 var(--radius-control) var(--radius-control) 0;
+  border-left: none;
+  right: 0;
+}
+
+/* Hover */
+.el-input-number__increase:hover,
+.el-input-number__decrease:hover {
+  color: var(--accent);
+  background: rgba(255, 255, 255, 0.78);
+  border-color: rgba(23, 107, 135, 0.3);
+}
+
+/* Prevent Element Plus from drawing a focus ring on the wrapper when a
+   control button is hovered — we style the button itself instead. */
+.el-input-number__increase:hover ~ .el-input:not(.is-disabled) .el-input__wrapper,
+.el-input-number__decrease:hover ~ .el-input:not(.is-disabled) .el-input__wrapper {
+  box-shadow: 0 0 0 1px rgba(148, 163, 184, 0.3) inset,
+              inset 0 1px 0 rgba(255, 255, 255, 0.5);
+}
+
+/* Disabled */
+.el-input-number__increase.is-disabled,
+.el-input-number__decrease.is-disabled {
+  color: var(--el-disabled-text-color);
+  background: rgba(245, 247, 250, 0.5);
+  border-color: var(--el-disabled-border-color);
+  cursor: not-allowed;
+}
+
+.el-input-number.is-disabled .el-input-number__increase,
+.el-input-number.is-disabled .el-input-number__decrease {
+  border-color: var(--el-disabled-border-color);
+  color: var(--el-disabled-border-color);
+}
+
+/* ── controls-position="right" (stacked up/down on the right side) ── */
+.el-input-number.is-controls-right .el-input__wrapper {
+  /* Let the wrapper keep full border-radius; the buttons will clip via
+     overflow on their own container corners. */
+  border-top-right-radius: var(--radius-control);
+  border-bottom-right-radius: var(--radius-control);
+  padding-right: 42px;
+}
+
+.el-input-number.is-controls-right .el-input-number__increase,
+.el-input-number.is-controls-right .el-input-number__decrease {
+  height: var(--el-input-number-controls-height);
+  line-height: var(--el-input-number-controls-height);
+  border-left: 1px solid rgba(148, 163, 184, 0.3);
+  border-right: none;
+  right: 0;
+  left: auto;
+}
+
+.el-input-number.is-controls-right .el-input-number__increase {
+  border-radius: 0 var(--radius-control) 0 0;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.3);
+  top: 0;
+  bottom: auto;
+}
+
+.el-input-number.is-controls-right .el-input-number__decrease {
+  border-radius: 0 0 var(--radius-control) 0;
+  border-top: none;
+  top: auto;
+  bottom: 0;
+}
+
+/* Small size controls-right height */
+.el-input-number.is-controls-right[class*="small"] .el-input-number__increase,
+.el-input-number.is-controls-right[class*="small"] .el-input-number__decrease {
+  --el-input-number-controls-height: 11px;
+}
+
+/* Large size controls-right height */
+.el-input-number.is-controls-right[class*="large"] .el-input-number__increase,
+.el-input-number.is-controls-right[class*="large"] .el-input-number__decrease {
+  --el-input-number-controls-height: 19px;
 }
 
 .el-segmented {

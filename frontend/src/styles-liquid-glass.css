@@ -1202,6 +1202,124 @@ button {
               var(--ring) !important;
 }
 
+/* ── Liquid Glass: el-input-group append/prepend ── */
+.el-input-group--append > .el-input__wrapper,
+.el-input-group--prepend > .el-input__wrapper {
+  border-top-right-radius: var(--radius-md) !important;
+  border-bottom-right-radius: var(--radius-md) !important;
+  border-top-left-radius: var(--radius-md) !important;
+  border-bottom-left-radius: var(--radius-md) !important;
+}
+
+.el-input-group--append > .el-input__wrapper {
+  border-top-right-radius: var(--radius-md) !important;
+  border-bottom-right-radius: var(--radius-md) !important;
+}
+
+.el-input-group--prepend > .el-input__wrapper {
+  border-top-left-radius: var(--radius-md) !important;
+  border-bottom-left-radius: var(--radius-md) !important;
+}
+
+.el-input-group__append,
+.el-input-group__prepend {
+  border: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
+  padding: 0 0 0 8px;
+}
+
+.el-input-group__prepend {
+  padding: 0 8px 0 0;
+}
+
+.el-input-group__append .el-button,
+.el-input-group__prepend .el-button {
+  margin: 0;
+  border: 1.5px solid rgba(148, 163, 184, 0.4) !important;
+  border-radius: var(--radius-md) !important;
+  background: rgba(255, 255, 255, 0.7) !important;
+  backdrop-filter: blur(var(--blur-sm)) saturate(180%);
+  -webkit-backdrop-filter: blur(var(--blur-sm)) saturate(180%);
+  box-shadow: 0 2px 8px rgba(15, 23, 42, 0.06),
+              inset 0 1px 0 rgba(255, 255, 255, 0.95),
+              inset 0 -1px 0 rgba(15, 23, 42, 0.03) !important;
+  color: var(--text-muted);
+}
+
+.el-input-group__append .el-button:hover,
+.el-input-group__prepend .el-button:hover {
+  border-color: rgba(148, 163, 184, 0.6) !important;
+  background: rgba(255, 255, 255, 0.85) !important;
+  color: var(--accent);
+}
+
+/* ── Liquid Glass: el-input-number control buttons ── */
+.el-input-number__increase,
+.el-input-number__decrease {
+  background: rgba(255, 255, 255, 0.58) !important;
+  border: 1.5px solid rgba(148, 163, 184, 0.4) !important;
+  backdrop-filter: blur(var(--blur-sm)) saturate(180%);
+  -webkit-backdrop-filter: blur(var(--blur-sm)) saturate(180%);
+  color: var(--text-muted);
+  transition: all var(--transition-base);
+  top: 0;
+  bottom: 0;
+}
+
+.el-input-number__decrease {
+  border-radius: var(--radius-md) 0 0 var(--radius-md) !important;
+  border-right: none !important;
+  left: 0;
+}
+
+.el-input-number__increase {
+  border-radius: 0 var(--radius-md) var(--radius-md) 0 !important;
+  border-left: none !important;
+  right: 0;
+}
+
+.el-input-number__increase:hover,
+.el-input-number__decrease:hover {
+  color: var(--accent);
+  background: rgba(255, 255, 255, 0.85) !important;
+  border-color: rgba(148, 163, 184, 0.6) !important;
+}
+
+.el-input-number__increase:hover ~ .el-input:not(.is-disabled) .el-input__wrapper,
+.el-input-number__decrease:hover ~ .el-input:not(.is-disabled) .el-input__wrapper {
+  box-shadow: 0 0 0 1px rgba(148, 163, 184, 0.4) inset,
+              inset 0 1px 0 rgba(255, 255, 255, 0.95),
+              inset 0 -1px 0 rgba(15, 23, 42, 0.03) !important;
+}
+
+.el-input-number.is-controls-right .el-input__wrapper {
+  border-top-right-radius: var(--radius-md) !important;
+  border-bottom-right-radius: var(--radius-md) !important;
+}
+
+.el-input-number.is-controls-right .el-input-number__increase,
+.el-input-number.is-controls-right .el-input-number__decrease {
+  border-left: 1.5px solid rgba(148, 163, 184, 0.4) !important;
+  border-right: none !important;
+  right: 0;
+  left: auto;
+}
+
+.el-input-number.is-controls-right .el-input-number__increase {
+  border-radius: 0 var(--radius-md) 0 0 !important;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.4) !important;
+  top: 0;
+  bottom: auto;
+}
+
+.el-input-number.is-controls-right .el-input-number__decrease {
+  border-radius: 0 0 var(--radius-md) 0 !important;
+  border-top: none !important;
+  top: auto;
+  bottom: 0;
+}
+
 /* Segmented Control - Liquid Glass */
 .el-segmented {
   background: rgba(255, 255, 255, 0.4) !important;

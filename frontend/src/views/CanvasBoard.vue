@@ -109,6 +109,7 @@
               :refresh-token="fileManagerRefreshToken(windowState.id)"
               :launcher-bridge-capabilities="launcherBridgeCapabilities"
               :workspace-root="systemInfo?.workspace_root"
+              :preview-providers="previewProviders"
               @path-change="path => updateFileManagerPath(windowState.id, path)"
               @open-file="item => openFileFromManager(windowState, item)"
               @selection-change="(items, primary) => updateFileManagerSelection(windowState.id, items, primary)"
@@ -168,6 +169,7 @@
               :file-managers="fileManagerTargets"
               :initial-bindings="terminalBindingSummary(windowState)"
               @bound-cwd-change="(managerId, path) => updateBoundFileManagerPath(managerId, path)"
+              @refresh-file-manager="(managerId, path) => refreshFileManagerFromTerminal(managerId, path)"
               @binding-summary-change="summary => updateTerminalBindingSummary(windowState.id, summary)"
             />
             <CanvasPreviewWindow
@@ -175,6 +177,7 @@
               :path="previewPath(windowState)"
               :preview-type="previewType(windowState)"
               :format="previewFormat(windowState)"
+              :preview-providers="previewProviders"
               @path-change="(path, metadata) => updatePreviewPath(windowState.id, path, metadata)"
             />
             <CanvasPluginWindow
@@ -186,6 +189,8 @@
               :api-base="pluginPayloadString(windowState, 'apiBase')"
               @payload-change="payload => updatePluginPayload(windowState.id, payload)"
               @title-change="title => updateWindowTitle(windowState.id, title)"
+              @register-provider="registerPreviewProvider"
+              @unregister-provider="unregisterPreviewProvider"
             />
             <div v-else class="canvas-placeholder">
               <strong>{{ windowState.title }}</strong>
@@ -220,7 +225,6 @@ import {
 import {
   loadLauncherBridgeCapabilities,
   parentDirectoryPath,
-  pollLauncherOpenSyncEvents,
   type LauncherBridgeCapabilities,
   type LauncherBridgeSyncEvent
 } from '../api/launcherBridge'
@@ -252,6 +256,7 @@ import {
   type ClientPreferences
 } from '../types/canvasBoard'
 import type { FileItem, PreviewType } from '../api/files'
+import type { FilePreviewProvider } from '../api/filePreviewProviders'
 import { useCanvasViewport } from '../composables/useCanvasViewport'
 import { useSystemStore } from '../stores/system'
 
@@ -278,6 +283,8 @@ const saveStatus = ref<SaveStatus>('saved')
 const terminalLayoutVersion = ref(0)
 const fileManagerRefreshTokens = ref<Record<string, number>>({})
 const launcherBridgeCapabilities = ref<LauncherBridgeCapabilities | null>(null)
+const previewProviders = ref<FilePreviewProvider[]>([])
+const previewProviderRegistrations = ref<Record<string, Record<string, FilePreviewProvider>>>({})
 let saveTimer: number | undefined
 let heartbeatTimer: number | undefined
 let hydrated = false
@@ -518,7 +525,7 @@ function createWindow(rawType: string) {
   if (!type || !board || !surface) return
   const rect = surface.getBoundingClientRect()
   const width = type === 'terminal' ? 680 : type === 'queue' ? 720 : type === 'file-manager' ? 620 : 520
-  const height = type === 'terminal' ? 420 : type === 'queue' ? 460 : type === 'file-manager' ? 430 : 340
+  const height = type === 'terminal' ? 630 : type === 'queue' ? 690 : type === 'file-manager' ? 645 : 510
   const x = (rect.width / 2 - board.viewport.x) / board.viewport.zoom - width / 2
   const y = (rect.height / 2 - board.viewport.y) / board.viewport.zoom - height / 2
   const payload = defaultPayload(type, board)
@@ -541,6 +548,40 @@ function createWindow(rawType: string) {
 
 function handleCreateWindowCommand(command: string | number | boolean) {
   createWindow(String(command))
+}
+
+function registerPreviewProvider(provider: FilePreviewProvider, ownerId = provider.id) {
+  previewProviderRegistrations.value = {
+    ...previewProviderRegistrations.value,
+    [provider.id]: {
+      ...(previewProviderRegistrations.value[provider.id] ?? {}),
+      [ownerId]: provider
+    }
+  }
+  syncPreviewProviders()
+}
+
+function unregisterPreviewProvider(providerId: string, ownerId = providerId) {
+  const registrations = { ...previewProviderRegistrations.value }
+  const owners = { ...(registrations[providerId] ?? {}) }
+  delete owners[ownerId]
+  if (Object.keys(owners).length > 0) {
+    registrations[providerId] = owners
+  } else {
+    delete registrations[providerId]
+  }
+  previewProviderRegistrations.value = registrations
+  syncPreviewProviders()
+}
+
+function syncPreviewProviders() {
+  previewProviders.value = Object.values(previewProviderRegistrations.value)
+    .map(registrations => {
+      const providers = Object.values(registrations)
+      return providers[providers.length - 1]
+    })
+    .filter((provider): provider is FilePreviewProvider => Boolean(provider))
+    .sort((left, right) => (right.priority ?? 0) - (left.priority ?? 0))
 }
 
 function activateWindow(windowId: string) {
@@ -610,6 +651,18 @@ function refreshFileManagersForDirectories(paths: string[]) {
   fileManagerRefreshTokens.value = next
 }
 
+function refreshFileManagerFromTerminal(managerId: string | null, path: string) {
+  if (!managerId) {
+    refreshFileManagersForDirectories([path])
+    return
+  }
+  updateFileManagerPath(managerId, path)
+  fileManagerRefreshTokens.value = {
+    ...fileManagerRefreshTokens.value,
+    [managerId]: (fileManagerRefreshTokens.value[managerId] ?? 0) + 1
+  }
+}
+
 async function loadLauncherBridge() {
   launcherBridgeCapabilities.value = await loadLauncherBridgeCapabilities()
 }
@@ -644,8 +697,8 @@ function updatePreviewPath(windowId: string, path: string, metadata?: { previewT
     windowState.payload = {
       ...(windowState.payload ?? {}),
       path,
-      previewType: metadata ? metadata.previewType : previousPath === path ? windowState.payload?.previewType : undefined,
-      format: metadata ? metadata.format : previousPath === path ? windowState.payload?.format : undefined
+      previewType: metadata ? (metadata.previewType ?? null) : (previousPath === path ? windowState.payload?.previewType : null),
+      format: metadata ? (metadata.format ?? null) : (previousPath === path ? windowState.payload?.format : null)
     }
     windowState.title = path ? path.split(/[\\/]/).pop() || t('canvas.window.preview') : t('canvas.window.preview')
   })
@@ -770,7 +823,7 @@ function createWindowNear(type: CanvasWindowType, sourceWindow: CanvasWindowStat
     x: sourceWindow.x + 34,
     y: sourceWindow.y + 34,
     width: type === 'tail' ? 520 : 560,
-    height: type === 'tail' ? 340 : 360,
+    height: type === 'tail' ? 510 : 540,
     zIndex: nextZIndex(board),
     payload
   }

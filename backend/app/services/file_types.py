@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -22,7 +23,6 @@ STRUCTURE_EXTENSIONS = {
     ".db": "db",
     ".lammps": "lammps",
     ".dump": "lammps-dump-text",
-    ".xml": "xml",
     ".gjf": "gaussian-in",
     ".com": "gaussian-in",
     ".fdf": "fdf",
@@ -44,6 +44,7 @@ TEXT_EXTENSIONS = {
     ".dat",
     ".csv",
     ".err",
+    ".xml",
 }
 
 TEXT_NAMES = {
@@ -53,31 +54,35 @@ TEXT_NAMES = {
     "POTCAR",
 }
 
-ASE_STRUCTURE_NAMES = {
-    "OUTCAR",
-    "XDATCAR",
-    "vasp.xml",
+ASE_STRUCTURE_NAMES: dict[str, Optional[str]] = {
+    "vasp.xml": "vasp-xml",
+    "vasprun.xml": "vasp-xml",
 }
+
+VASP_STRUCTURE_NAME_RE = re.compile(
+    r"(^|[^A-Z0-9])(POSCAR|CONTCAR|XDATCAR|OUTCAR)(?:[0-9]+)?($|[^A-Z0-9])"
+)
 
 
 def is_forced_structure_name(path: Path) -> bool:
-    name = path.name.upper()
-    return "POSCAR" in name or "CONTCAR" in name
+    return bool(VASP_STRUCTURE_NAME_RE.search(path.name.upper()))
 
 
 def detect_preview(path: Path, *, is_dir: bool = False) -> tuple[str, Optional[str]]:
     if is_dir:
         return "directory", None
 
+    lower_name = path.name.lower()
+    if lower_name in ASE_STRUCTURE_NAMES:
+        return "structure", ASE_STRUCTURE_NAMES[lower_name]
+
     if is_forced_structure_name(path):
         return "structure", None
 
-    if "OUTCAR" in path.name.upper() or path.name.upper() in ASE_STRUCTURE_NAMES or path.name.lower() in ASE_STRUCTURE_NAMES:
-        return "structure", None
-
     suffix = path.suffix.lower()
-    if suffix in STRUCTURE_EXTENSIONS:
-        return "structure", STRUCTURE_EXTENSIONS[suffix]
     if suffix in TEXT_EXTENSIONS or path.name.upper() in TEXT_NAMES:
         return "text", None
+
+    if suffix in STRUCTURE_EXTENSIONS:
+        return "structure", STRUCTURE_EXTENSIONS[suffix]
     return "file", None

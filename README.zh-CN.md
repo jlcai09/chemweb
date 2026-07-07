@@ -109,7 +109,7 @@ viewer:
     prefer_binary: true
     max_atoms: 200000
     max_frames: 5000
-    binary_chunk_frames: 64
+    binary_chunk_frames: 32
 
 terminal:
   enabled: true
@@ -153,6 +153,8 @@ chmod +x create-release-archive.sh
 Windows 用户请使用 Git Bash 运行 `.sh` 脚本。该脚本是受支持的发行打包入口，会同时生成 `.tar.gz` 和 `.zip` 格式。
 
 脚本会自动构建前端，创建 `release/chemssh-{版本号}/` 发行目录、`.tar.gz` 和 `.zip` 压缩包及校验和文件。发行包包含预构建的 `frontend/dist/`（用户无需 Node.js）。
+
+如果需要离线 PyInstaller runtime，并且希望后端代码保持明文、后续可直接替换更新，请阅读 [packaging/pyinstaller-external-backend.md](packaging/pyinstaller-external-backend.md)。
 
 详细发行流程见 [docs/RELEASE.md](docs/RELEASE.md)。
 

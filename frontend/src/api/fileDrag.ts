@@ -83,7 +83,8 @@ export function readChemSSHFileDrag(dataTransfer: DataTransfer | null): ChemSSHF
         size: null,
         mtime: '',
         extension: '',
-        preview_type: 'file'
+        preview_type: 'file',
+        format: null
       }))
     }
   }

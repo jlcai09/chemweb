@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import socket
 import sys
 from dataclasses import dataclass
@@ -51,7 +52,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--reload", action="store_true", help="Enable uvicorn reload")
     parser.add_argument("--log-level", default="info", help="uvicorn log level")
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable ChemSSH debug mode, including expensive structure streaming timing probes.",
+    )
     return parser
+
+
+def _run_terminal_transfer_shim(args: Sequence[str]) -> int:
+    if len(args) < 2:
+        print("chemssh: --terminal-transfer-shim requires direction and shim directory", file=sys.stderr)
+        return 2
+    direction, shim_dir, *transfer_args = args
+    if direction not in {"upload", "download"}:
+        print(f"chemssh: invalid transfer shim direction: {direction}", file=sys.stderr)
+        return 2
+    from backend.app.providers.terminal.local_pty import run_transfer_shim
+
+    return run_transfer_shim(direction, shim_dir, transfer_args)
 
 
 def _probe_host(host: str) -> str:
@@ -219,7 +238,15 @@ def _get_minimal_config(args: argparse.Namespace) -> tuple[str, int, Path, str |
 
 
 def main(argv: Sequence[str] | None = None) -> None:
-    args = build_parser().parse_args(argv)
+    raw_args = list(sys.argv[1:] if argv is None else argv)
+    if raw_args[:1] == ["--terminal-transfer-shim"]:
+        raise SystemExit(_run_terminal_transfer_shim(raw_args[1:]))
+
+    args = build_parser().parse_args(raw_args)
+    if args.debug:
+        os.environ["CHEMSSH_DEBUG"] = "1"
+        if args.reuse_existing == "auto":
+            args.reuse_existing = "never"
 
     # Step 1: Get minimal config for detection (fast path, minimal imports)
     host, port, workspace_root, token = _get_minimal_config(args)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import re
@@ -13,6 +14,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 import xml.etree.ElementTree as ET
+
+logger = logging.getLogger(__name__)
 
 import numpy as np
 from ase import Atoms
@@ -101,6 +104,7 @@ class StructureSummary:
     fast_xyz_index: "FastXyzIndex | None" = None
     fast_native_index: "FastNativeIndex | None" = None
     fast_xdatcar_index: "FastXdatcarIndex | None" = None
+    fast_xdatcar_variable_index: "FastXdatcarVariableIndex | None" = None
     fast_arc_index: "FastArcIndex | None" = None
     fast_outcar_index: "FastOutcarIndex | None" = None
     loaded_frames: tuple[Atoms, ...] | None = None
@@ -123,11 +127,28 @@ class FrameData:
 
 
 @dataclass(frozen=True)
+class StructureChunkArrays:
+    count: int
+    positions: np.ndarray
+    cells: np.ndarray
+    tags: np.ndarray
+    fixed_mask: np.ndarray
+    energy: np.ndarray
+    fmax: np.ndarray
+    symbols: tuple[str, ...]
+    numbers: np.ndarray
+    pbc: tuple[bool, bool, bool]
+
+
+@dataclass(frozen=True)
 class FastXyzIndex:
     frame_offsets: tuple[int, ...]
     frame_lengths: tuple[int, ...]
     atom_counts: tuple[int, ...]
     detected_format: str
+    complete: bool = True
+    n_frames: int | None = None
+    last_frame_offset: int | None = None
 
 
 @dataclass(frozen=True)
@@ -143,6 +164,13 @@ class FastXdatcarIndex:
     symbols: tuple[str, ...]
     numbers: tuple[int, ...]
     cell: tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]]
+    fixed_indices: tuple[int, ...] = ()
+    detected_format: str = "vasp-xdatcar"
+
+
+@dataclass(frozen=True)
+class FastXdatcarVariableIndex:
+    header_offsets: tuple[int, ...]
     detected_format: str = "vasp-xdatcar"
 
 
@@ -219,6 +247,24 @@ class FastParserUnsupported(Exception):
     pass
 
 
+def _profile_add(profile: dict[str, Any] | None, key: str, value: float) -> None:
+    if profile is not None:
+        profile[key] = float(profile.get(key, 0.0) or 0.0) + float(value)
+
+
+def _profile_start(profile: dict[str, Any] | None) -> float:
+    return time.perf_counter() if profile is not None else 0.0
+
+
+def _profile_add_ms(profile: dict[str, Any] | None, key: str, start: float) -> None:
+    if profile is not None:
+        _profile_add(profile, key, (time.perf_counter() - start) * 1000.0)
+
+
+def _profile_set(profile: dict[str, Any] | None, key: str, value: Any) -> None:
+    if profile is not None:
+        profile[key] = value
+
 class StructureService:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -242,7 +288,6 @@ class StructureService:
         points = summary.n_atoms * summary.n_frames
         use_binary = (
             self.settings.viewer.ase.prefer_binary
-            and summary.topology_stable
             and summary.n_frames > 1
         )
 
@@ -306,17 +351,22 @@ class StructureService:
 
         path = self._resolve_structure_file(raw_path, force=force)
         summary = self._get_structure_summary(path, fmt, allow_incomplete=False)
-        if not summary.topology_stable:
-            raise AppError(
-                "STRUCTURE_TOPOLOGY_UNSTABLE",
-                "Binary frame chunks require a stable atom count and element order",
-                409,
-            )
         if start >= summary.n_frames:
             raise AppError("FRAME_INDEX_OUT_OF_RANGE", f"Frame start is outside range: {start}", 404)
 
         max_count = self.settings.viewer.ase.binary_chunk_frames
         safe_count = min(count, max_count, summary.n_frames - start)
+        direct_payload = self._try_build_direct_fixed_binary_payload(
+            path=path,
+            summary=summary,
+            start=start,
+            count=safe_count,
+            n_frames_total=summary.n_frames,
+            profile=None,
+        )
+        if direct_payload is not None:
+            return direct_payload
+
         frames = self._read_frame_range(path, start, safe_count, fmt, summary=summary)
         if len(frames) != safe_count:
             raise AppError("FRAME_INDEX_OUT_OF_RANGE", "Requested frame chunk is incomplete", 404)
@@ -327,6 +377,59 @@ class StructureService:
             n_frames_total=summary.n_frames,
             detected_format=summary.detected_format,
         )
+
+    def stream_frame_chunk_binary(
+        self,
+        resolved_path: Path,
+        start: int,
+        count: int,
+        fmt: str | None,
+        summary: "StructureSummary",
+        profile: dict[str, Any] | None = None,
+    ) -> bytes:
+        """Read a binary chunk using an already-resolved path and cached summary.
+
+        This avoids the redundant path-resolution and summary lookup that
+        ``read_frame_chunk_binary`` performs on every call, which matters for
+        SSE streaming where hundreds of chunks are read in rapid succession.
+        """
+        if start < 0:
+            raise AppError("INVALID_FRAME_RANGE", "Chunk start must be greater than or equal to 0", 400)
+        if count <= 0:
+            raise AppError("INVALID_FRAME_RANGE", "Chunk count must be greater than 0", 400)
+        if start >= summary.n_frames:
+            raise AppError("FRAME_INDEX_OUT_OF_RANGE", f"Frame start is outside range: {start}", 404)
+
+        max_count = self.settings.viewer.ase.binary_chunk_frames
+        safe_count = min(count, max_count, summary.n_frames - start)
+        _profile_set(profile, "safe_count", safe_count)
+        direct_payload = self._try_build_direct_fixed_binary_payload(
+            path=resolved_path,
+            summary=summary,
+            start=start,
+            count=safe_count,
+            n_frames_total=summary.n_frames,
+            profile=profile,
+        )
+        if direct_payload is not None:
+            return direct_payload
+
+        t_read_0 = _profile_start(profile)
+        frames = self._read_frame_range(resolved_path, start, safe_count, fmt, summary=summary, profile=profile)
+        _profile_add_ms(profile, "read_frame_range_ms", t_read_0)
+        if len(frames) != safe_count and summary.scan_completed:
+            raise AppError("FRAME_INDEX_OUT_OF_RANGE", "Requested frame chunk is incomplete", 404)
+        t_build_0 = _profile_start(profile)
+        payload = self._build_binary_payload_from_frames(
+            path=resolved_path,
+            frames=frames,
+            start=start,
+            n_frames_total=summary.n_frames,
+            detected_format=summary.detected_format,
+            profile=profile,
+        )
+        _profile_add_ms(profile, "build_payload_total_ms", t_build_0)
+        return payload
 
     def _resolve_structure_file(self, raw_path: str, *, force: bool = False) -> Path:
         if not self.settings.viewer.ase.enabled:
@@ -388,6 +491,9 @@ class StructureService:
             return self._get_structure_summary(path, fmt, allow_incomplete=allow_incomplete)
         return self._get_cached_structure_summary(path, fmt)
 
+    def stream_requires_complete_summary(self, path: Path, fmt: str | None) -> bool:
+        return _is_vasp_xdatcar_format(path, fmt)
+
     def _get_cached_structure_summary(self, path: Path, fmt: str | None) -> StructureSummary | None:
         key = self._cache_key(path, fmt)
         return _get_cached_summary(key)
@@ -403,7 +509,7 @@ class StructureService:
             return self._scan_native_indexed(path, fmt, cancellation)
         if _is_vasp_xdatcar_format(path, fmt):
             try:
-                return self._scan_xdatcar(path, cancellation)
+                return self._scan_xdatcar(path, cancellation, force_full_scan=force_full_scan)
             except FastParserUnsupported:
                 return self._scan_structure_with_ase(path, fmt, cancellation)
         if _is_vasp_outcar_format(path, fmt):
@@ -481,11 +587,17 @@ class StructureService:
 
     def _find_xdatcar_last_frame_offset(self, path: Path) -> int | None:
         """从文件尾部反向搜索最后一个 'Direct configuration=' 的偏移。"""
-        try:
-            tail_data, file_size, tail_offset = _tail_read_from_end(path)
-            return _find_last_marker_offset(tail_data, file_size, tail_offset, b"Direct configuration=")
-        except OSError:
-            return None
+        for max_bytes in (1_048_576, 4_194_304, 16_777_216, 67_108_864):
+            try:
+                tail_data, file_size, tail_offset = _tail_read_from_end(path, max_bytes=max_bytes)
+            except OSError:
+                return None
+            marker_offset = _find_last_marker_offset(tail_data, file_size, tail_offset, b"Direct configuration=")
+            if marker_offset is not None:
+                return marker_offset
+            if tail_offset == 0:
+                return None
+        return None
 
     def _find_arc_last_frame_offset(self, path: Path) -> int | None:
         """从文件尾部反向搜索最后一个 '!DATE' 的偏移。"""
@@ -535,16 +647,181 @@ class StructureService:
         self,
         path: Path,
         cancellation: StructureCancellationToken | None = None,
+        force_full_scan: bool = False,
     ) -> StructureSummary:
-        """反向扫描最后一帧 + 正向全扫描。"""
-        TAIL_THRESHOLD = 10 * 1024 * 1024  # 10MB
+        """扫描 XDATCAR。预览大文件时只定位最后一帧，完整读取时建立随机访问索引。"""
         file_size = path.stat().st_size
 
-        if file_size < TAIL_THRESHOLD:
-            return self._scan_xdatcar_forward(path, cancellation)
+        if not force_full_scan and file_size >= self._xdatcar_preview_fast_threshold_bytes():
+            try:
+                return self._scan_xdatcar_preview_fast(path, cancellation)
+            except FastParserUnsupported:
+                pass
 
-        # 正向扫描构建完整偏移表（包含最后一帧数据）
         return self._scan_xdatcar_forward(path, cancellation)
+
+    def _xdatcar_preview_fast_threshold_bytes(self) -> int:
+        return 0
+
+    def _scan_xdatcar_preview_fast(
+        self,
+        path: Path,
+        cancellation: StructureCancellationToken | None = None,
+    ) -> StructureSummary:
+        cancellation = cancellation or StructureCancellationToken()
+
+        header = self._read_xdatcar_standard_header(path)
+        last_marker_offset = self._find_xdatcar_last_frame_offset(path)
+        if last_marker_offset is None:
+            raise FastParserUnsupported("Could not find last XDATCAR frame marker")
+        marker_line = self._xdatcar_marker_line_at_offset(path, last_marker_offset)
+        n_frames = _xdatcar_frame_number_from_marker(marker_line)
+        if n_frames is None:
+            n_frames, _first_marker_offset = self._count_binary_marker_occurrences(
+                path,
+                b"Direct configuration=",
+                cancellation,
+            )
+        if n_frames <= 0:
+            raise FastParserUnsupported("XDATCAR has no Direct configuration frames")
+        if n_frames > self.settings.viewer.ase.max_frames:
+            raise AppError(
+                "STRUCTURE_TOO_MANY_FRAMES",
+                f"Structure has more than {self.settings.viewer.ase.max_frames} frames",
+                413,
+            )
+
+        last_header_offset: int | None = None
+        try:
+            with path.open("rb") as handle:
+                last_header_offset = self._xdatcar_header_offset_before_marker(handle, last_marker_offset)
+        except OSError:
+            last_header_offset = None
+
+        if n_frames >= 2 and last_header_offset is not None and last_header_offset > 0:
+            last_index = FastXdatcarVariableIndex(header_offsets=(last_header_offset,))
+            last_frame_data = self._read_xdatcar_variable_frame(path, last_index, 0)
+            self._validate_frame_data(last_frame_data, path)
+            return StructureSummary(
+                n_frames=n_frames,
+                n_atoms=_frame_atom_count(last_frame_data),
+                last_atoms=None,
+                last_frame_data=last_frame_data,
+                topology_stable=False,
+                detected_format="vasp-xdatcar",
+                scan_completed=False,
+            )
+
+        fixed_indices, constraint_warning = _read_outcar_fixed_indices_from_neighbor(path, header["n_atoms"])
+        index = FastXdatcarIndex(
+            frame_offsets=(self._xdatcar_coordinate_offset_after_marker(path, last_marker_offset),),
+            n_atoms=header["n_atoms"],
+            symbols=header["symbols"],
+            numbers=header["numbers"],
+            cell=header["cell"],
+            fixed_indices=fixed_indices,
+        )
+        last_frame_data = self._read_xdatcar_frame(path, index, 0)
+        self._validate_frame_data(last_frame_data, path)
+        return StructureSummary(
+            n_frames=n_frames,
+            n_atoms=header["n_atoms"],
+            last_atoms=None,
+            last_frame_data=last_frame_data,
+            topology_stable=True,
+            detected_format=index.detected_format,
+            scan_completed=False,
+            warnings=(constraint_warning,) if constraint_warning else (),
+        )
+
+    def _read_xdatcar_standard_header(self, path: Path) -> dict[str, Any]:
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                handle.readline()
+                scale_values = _parse_vasp_scaling_factor(handle.readline())
+                raw_cell = np.array([handle.readline().split()[:3] for _ in range(3)], dtype=np.float64)
+                if scale_values[0] < 0.0:
+                    scale_values = np.cbrt(-1.0 * scale_values / np.linalg.det(raw_cell))
+                cell = raw_cell * scale_values
+
+                symbol_tokens = handle.readline().split()
+                count_tokens = handle.readline().split()
+                if not symbol_tokens or not count_tokens:
+                    raise FastParserUnsupported("XDATCAR header is incomplete")
+                try:
+                    counts = [int(value) for value in count_tokens]
+                except ValueError as exc:
+                    raise FastParserUnsupported("XDATCAR atom counts are not standard VASP 5 format") from exc
+                if len(symbol_tokens) != len(counts):
+                    raise FastParserUnsupported("XDATCAR symbols and counts do not match")
+
+                symbols: list[str] = []
+                numbers: list[int] = []
+                for symbol_token, count in zip(symbol_tokens, counts):
+                    symbol = _normalize_symbol(symbol_token)
+                    try:
+                        number = _atomic_number_from_normalized_symbol(symbol)
+                    except ValueError as exc:
+                        raise FastParserUnsupported("XDATCAR contains unsupported atom symbols") from exc
+                    symbols.extend([symbol] * count)
+                    numbers.extend([number] * count)
+                n_atoms = sum(counts)
+                if n_atoms <= 0:
+                    raise FastParserUnsupported("XDATCAR has no atoms")
+                if n_atoms > self.settings.viewer.ase.max_atoms:
+                    raise AppError(
+                        "STRUCTURE_TOO_MANY_ATOMS",
+                        f"Structure has {n_atoms} atoms; limit is {self.settings.viewer.ase.max_atoms}",
+                        413,
+                    )
+                return {
+                    "n_atoms": n_atoms,
+                    "symbols": tuple(symbols),
+                    "numbers": tuple(numbers),
+                    "cell": tuple(tuple(float(value) for value in row) for row in cell),
+                }
+        except FastParserUnsupported:
+            raise
+        except AppError:
+            raise
+        except Exception as exc:
+            raise AppError("STRUCTURE_PARSE_FAILED", f"ASE could not parse {path.name}: {exc}", 400) from exc
+
+    def _require_xdatcar_header_offset(self, path: Path, marker_offset: int) -> int:
+        try:
+            with path.open("rb") as handle:
+                header_offset = self._xdatcar_header_offset_before_marker(handle, marker_offset)
+        except OSError as exc:
+            raise FastParserUnsupported("Could not read XDATCAR frame header") from exc
+        if header_offset is None:
+            raise FastParserUnsupported("Could not locate XDATCAR frame header")
+        return header_offset
+
+    def _xdatcar_marker_line_at_offset(self, path: Path, marker_offset: int) -> str:
+        try:
+            with path.open("rb") as handle:
+                handle.seek(marker_offset)
+                marker_line = handle.readline()
+                if not marker_line.startswith(b"Direct configuration="):
+                    raise FastParserUnsupported("XDATCAR frame marker is invalid")
+                return marker_line.decode("utf-8", errors="replace")
+        except FastParserUnsupported:
+            raise
+        except OSError as exc:
+            raise FastParserUnsupported("Could not read XDATCAR frame marker") from exc
+
+    def _xdatcar_coordinate_offset_after_marker(self, path: Path, marker_offset: int) -> int:
+        try:
+            with path.open("rb") as handle:
+                handle.seek(marker_offset)
+                marker_line = handle.readline()
+                if not marker_line.startswith(b"Direct configuration="):
+                    raise FastParserUnsupported("XDATCAR frame marker is invalid")
+                return handle.tell()
+        except FastParserUnsupported:
+            raise
+        except OSError as exc:
+            raise FastParserUnsupported("Could not read XDATCAR frame marker") from exc
 
     def _scan_xdatcar_forward(
         self,
@@ -600,6 +877,7 @@ class StructureService:
                     cancellation,
                 )
                 frame_offsets = [next_line_start for _line_start, next_line_start in marker_lines]
+                marker_offsets = [line_start for line_start, _next_line_start in marker_lines]
                 if len(frame_offsets) > self.settings.viewer.ase.max_frames:
                     raise AppError(
                         "STRUCTURE_TOO_MANY_FRAMES",
@@ -616,12 +894,32 @@ class StructureService:
         if not frame_offsets:
             raise FastParserUnsupported("XDATCAR has no Direct configuration frames")
 
+        variable_header_offsets = self._xdatcar_variable_header_offsets(path, marker_offsets)
+        if variable_header_offsets is not None:
+            variable_index = FastXdatcarVariableIndex(header_offsets=variable_header_offsets)
+            last_frame_data = self._read_xdatcar_variable_frame(path, variable_index, len(variable_header_offsets) - 1)
+            self._validate_frame_data(last_frame_data, path)
+            first_frame_data = self._read_xdatcar_variable_frame(path, variable_index, 0)
+            self._validate_frame_data(first_frame_data, path)
+            return StructureSummary(
+                n_frames=len(variable_header_offsets),
+                n_atoms=_frame_atom_count(first_frame_data),
+                last_atoms=None,
+                last_frame_data=last_frame_data,
+                topology_stable=False,
+                detected_format=variable_index.detected_format,
+                fast_xdatcar_variable_index=variable_index,
+            )
+
+        fixed_indices, constraint_warning = _read_outcar_fixed_indices_from_neighbor(path, n_atoms)
+
         index = FastXdatcarIndex(
             frame_offsets=tuple(frame_offsets),
             n_atoms=n_atoms,
             symbols=tuple(symbols),
             numbers=tuple(numbers),
             cell=tuple(tuple(float(value) for value in row) for row in cell),
+            fixed_indices=fixed_indices,
         )
         last_frame_data = self._read_xdatcar_frame(path, index, len(frame_offsets) - 1)
         self._validate_frame_data(last_frame_data, path)
@@ -634,7 +932,99 @@ class StructureService:
             topology_stable=True,
             detected_format=index.detected_format,
             fast_xdatcar_index=index,
+            warnings=(constraint_warning,) if constraint_warning else (),
         )
+
+    def _xdatcar_variable_header_offsets(
+        self,
+        path: Path,
+        marker_offsets: list[int] | tuple[int, ...] | None = None,
+    ) -> tuple[int, ...] | None:
+        if marker_offsets is not None:
+            return self._xdatcar_variable_header_offsets_from_marker_offsets(path, marker_offsets)
+        return self._xdatcar_variable_header_offsets_by_text_scan(path)
+
+    def _xdatcar_variable_header_offsets_from_marker_offsets(
+        self,
+        path: Path,
+        marker_offsets: list[int] | tuple[int, ...],
+    ) -> tuple[int, ...] | None:
+        header_offsets: list[int] = []
+        try:
+            with path.open("rb") as handle:
+                for marker_offset in marker_offsets:
+                    header_offset = self._xdatcar_header_offset_before_marker(handle, marker_offset)
+                    if header_offset is None:
+                        return None
+                    header_offsets.append(header_offset)
+        except OSError:
+            return None
+        return tuple(header_offsets) if len(header_offsets) >= 2 else None
+
+    def _xdatcar_header_offset_before_marker(self, handle: Any, marker_offset: int) -> int | None:
+        max_window = 1_048_576
+        window = 4096
+
+        while True:
+            start = max(0, marker_offset - window)
+            handle.seek(start)
+            data = handle.read(marker_offset - start)
+            line_starts = [0]
+            line_starts.extend(index + 1 for index, byte in enumerate(data) if byte == 10 and index + 1 < len(data))
+
+            candidate_index = len(line_starts) - 7
+            if candidate_index >= 0 and (start == 0 or line_starts[candidate_index] != 0):
+                previous: list[tuple[int, str]] = []
+                candidate_starts = line_starts[candidate_index:]
+                for offset_index, line_start in enumerate(candidate_starts):
+                    line_end = candidate_starts[offset_index + 1] if offset_index + 1 < len(candidate_starts) else len(data)
+                    line = data[line_start:line_end].decode("utf-8")
+                    previous.append((start + line_start, line))
+                return self._xdatcar_header_offset_from_previous(previous)
+
+            if start == 0 or window >= max_window:
+                return None
+            window = min(max_window, window * 4)
+
+    def _xdatcar_variable_header_offsets_by_text_scan(self, path: Path) -> tuple[int, ...] | None:
+        header_offsets: list[int] = []
+        previous: list[tuple[int, str]] = []
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                while True:
+                    offset = handle.tell()
+                    line = handle.readline()
+                    if line == "":
+                        break
+                    if line.startswith("Direct configuration="):
+                        header_offset = self._xdatcar_header_offset_from_previous(previous)
+                        if header_offset is None:
+                            return None
+                        header_offsets.append(header_offset)
+                    previous.append((offset, line))
+                    if len(previous) > 7:
+                        previous.pop(0)
+        except OSError:
+            return None
+        return tuple(header_offsets) if len(header_offsets) >= 2 else None
+
+    def _xdatcar_header_offset_from_previous(self, previous: list[tuple[int, str]]) -> int | None:
+        if len(previous) < 7:
+            return None
+        try:
+            scale_values = _parse_vasp_scaling_factor(previous[-6][1])
+            raw_cell = np.array([previous[-5][1].split()[:3], previous[-4][1].split()[:3], previous[-3][1].split()[:3]], dtype=np.float64)
+            if raw_cell.shape != (3, 3):
+                return None
+            _ = raw_cell * scale_values
+            symbol_tokens = previous[-2][1].split()
+            count_tokens = previous[-1][1].split()
+            counts = [int(value) for value in count_tokens]
+            if not symbol_tokens or len(symbol_tokens) != len(counts) or sum(counts) <= 0:
+                return None
+        except Exception:
+            return None
+        return previous[-7][0]
 
     def _scan_vasp_poscar(self, path: Path) -> StructureSummary:
         try:
@@ -997,6 +1387,9 @@ class StructureService:
             frame_lengths=tuple(sample_lengths),
             atom_counts=tuple(sample_atom_counts),
             detected_format=detected_format,
+            complete=False,
+            n_frames=estimated_n_frames,
+            last_frame_offset=last_frame_offset,
         )
 
         return StructureSummary(
@@ -1113,6 +1506,45 @@ class StructureService:
                 overlap = data[-overlap_size:]
 
         return marker_lines
+
+    def _count_binary_marker_occurrences(
+        self,
+        path: Path,
+        marker: bytes,
+        cancellation: StructureCancellationToken | None = None,
+    ) -> tuple[int, int | None]:
+        cancellation = cancellation or StructureCancellationToken()
+        overlap_size = max(0, len(marker) - 1)
+        overlap = b""
+        count = 0
+        first_offset: int | None = None
+
+        with path.open("rb") as handle:
+            while True:
+                cancellation.check()
+                chunk_start = handle.tell()
+                chunk = handle.read(8 * 1024 * 1024)
+                if not chunk:
+                    break
+
+                data = overlap + chunk
+                data_offset = chunk_start - len(overlap)
+                search_start = 0
+                while True:
+                    marker_pos = data.find(marker, search_start)
+                    if marker_pos == -1:
+                        break
+                    marker_offset = data_offset + marker_pos
+                    search_start = marker_pos + len(marker)
+                    if marker_offset < chunk_start and chunk_start > 0:
+                        continue
+                    if first_offset is None:
+                        first_offset = marker_offset
+                    count += 1
+
+                overlap = data[-overlap_size:] if overlap_size else b""
+
+        return count, first_offset
 
     def _find_extxyz_frame_offsets_binary(
         self,
@@ -1525,6 +1957,13 @@ class StructureService:
             self._validate_frame_data(frame, path)
             return frame
 
+        if summary and summary.fast_xdatcar_variable_index:
+            if index >= summary.n_frames:
+                raise AppError("FRAME_INDEX_OUT_OF_RANGE", f"Frame index is outside range: {index}", 404)
+            frame = self._read_xdatcar_variable_frame(path, summary.fast_xdatcar_variable_index, index)
+            self._validate_frame_data(frame, path)
+            return frame
+
         if summary and summary.fast_arc_index:
             if index >= summary.n_frames:
                 raise AppError("FRAME_INDEX_OUT_OF_RANGE", f"Frame index is outside range: {index}", 404)
@@ -1576,8 +2015,9 @@ class StructureService:
 
         raise AppError("FRAME_INDEX_OUT_OF_RANGE", f"Frame index is outside range: {index}", 404)
 
-    def _read_frame_range(self, path: Path, start: int, count: int, fmt: str | None, summary: StructureSummary | None = None) -> list[Atoms | FrameData]:
+    def _read_frame_range(self, path: Path, start: int, count: int, fmt: str | None, summary: StructureSummary | None = None, profile: dict[str, Any] | None = None) -> list[Atoms | FrameData]:
         if summary and summary.loaded_frames is not None:
+            _profile_set(profile, "read_path", "loaded_frames")
             end = min(start + count, summary.n_frames)
             frames = list(summary.loaded_frames[start:end])
             for atoms in frames:
@@ -1585,13 +2025,23 @@ class StructureService:
             return frames
 
         if summary and summary.fast_xdatcar_index:
+            _profile_set(profile, "read_path", "fast_xdatcar")
             end = min(start + count, summary.n_frames)
             frames = self._read_xdatcar_frame_range(path, summary.fast_xdatcar_index, start, end)
             for frame in frames:
                 self._validate_frame_data(frame, path)
             return frames
 
+        if summary and summary.fast_xdatcar_variable_index:
+            _profile_set(profile, "read_path", "fast_xdatcar_variable")
+            end = min(start + count, summary.n_frames)
+            frames = self._read_xdatcar_variable_frame_range(path, summary.fast_xdatcar_variable_index, start, end)
+            for frame in frames:
+                self._validate_frame_data(frame, path)
+            return frames
+
         if summary and summary.fast_arc_index:
+            _profile_set(profile, "read_path", "fast_arc")
             end = min(start + count, summary.n_frames)
             frames = self._read_dmol_arc_frame_range(path, summary.fast_arc_index, start, end)
             for frame in frames:
@@ -1599,6 +2049,7 @@ class StructureService:
             return frames
 
         if summary and summary.fast_outcar_index:
+            _profile_set(profile, "read_path", "fast_outcar")
             end = min(start + count, summary.n_frames)
             frames = self._read_outcar_frame_range(path, summary.fast_outcar_index, start, end)
             for frame in frames:
@@ -1606,6 +2057,7 @@ class StructureService:
             return frames
 
         if summary and summary.fast_native_index:
+            _profile_set(profile, "read_path", f"fast_native:{summary.fast_native_index.detected_format}")
             end = min(start + count, summary.n_frames)
             frames = self._read_native_frame_range(path, summary.fast_native_index.detected_format, start, end)
             for frame in frames:
@@ -1613,9 +2065,17 @@ class StructureService:
             return frames
 
         if summary and summary.fast_xyz_index:
+            _profile_set(profile, "read_path", f"fast_xyz:{summary.fast_xyz_index.detected_format}")
             end = min(start + count, summary.n_frames)
             if summary.fast_xyz_index.detected_format == "xyz":
-                frames = self._read_plain_xyz_frame_range(path, summary.fast_xyz_index, start, end)
+                frames = self._read_plain_xyz_frame_range(
+                    path,
+                    summary.fast_xyz_index,
+                    start,
+                    end,
+                    summary=summary,
+                    profile=profile,
+                )
             else:
                 frames = [
                     self._read_xyz_like_frame(path, summary.fast_xyz_index, frame_index)
@@ -1625,6 +2085,7 @@ class StructureService:
                 self._validate_structure_frame(frame, path)
             return frames
 
+        _profile_set(profile, "read_path", "ase_iread")
         end = start + count
         frames: list[Atoms] = []
         try:
@@ -1719,6 +2180,89 @@ class StructureService:
             numbers=np.asarray(index.numbers, dtype=np.int32),
             symbols=index.symbols,
             cell=cell,
+            pbc=(True, True, True),
+            fixed_indices=index.fixed_indices,
+        )
+
+    def _read_xdatcar_variable_frame(
+        self,
+        path: Path,
+        index: FastXdatcarVariableIndex,
+        frame_index: int,
+    ) -> FrameData:
+        try:
+            header_offset = index.header_offsets[frame_index]
+        except IndexError:
+            raise AppError("FRAME_INDEX_OUT_OF_RANGE", f"Frame index is outside range: {frame_index}", 404) from None
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                handle.seek(header_offset)
+                return self._read_xdatcar_variable_frame_from_handle(handle)
+        except AppError:
+            raise
+        except Exception as exc:
+            raise AppError("STRUCTURE_PARSE_FAILED", f"ASE could not parse {path.name}: {exc}", 400) from exc
+
+    def _read_xdatcar_variable_frame_range(
+        self,
+        path: Path,
+        index: FastXdatcarVariableIndex,
+        start: int,
+        end: int,
+    ) -> list[FrameData]:
+        frames: list[FrameData] = []
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                for frame_index in range(start, end):
+                    handle.seek(index.header_offsets[frame_index])
+                    frames.append(self._read_xdatcar_variable_frame_from_handle(handle))
+            return frames
+        except AppError:
+            raise
+        except Exception as exc:
+            raise AppError("STRUCTURE_PARSE_FAILED", f"ASE could not parse {path.name}: {exc}", 400) from exc
+
+    def _read_xdatcar_variable_frame_from_handle(self, handle: Any) -> FrameData:
+        handle.readline()
+        scale_values = _parse_vasp_scaling_factor(handle.readline())
+        raw_cell = np.array([handle.readline().split()[:3] for _ in range(3)], dtype=np.float64)
+        if scale_values[0] < 0.0:
+            scale_values = np.cbrt(-1.0 * scale_values / np.linalg.det(raw_cell))
+        cell = raw_cell * scale_values
+
+        symbol_tokens = handle.readline().split()
+        count_tokens = handle.readline().split()
+        if not symbol_tokens or not count_tokens:
+            raise ValueError("XDATCAR variable frame header is incomplete")
+        counts = [int(value) for value in count_tokens]
+        if len(symbol_tokens) != len(counts):
+            raise ValueError("XDATCAR variable frame symbols and counts do not match")
+
+        symbols: list[str] = []
+        numbers: list[int] = []
+        for symbol_token, count in zip(symbol_tokens, counts):
+            symbol = _normalize_symbol(symbol_token)
+            number = _atomic_number_from_normalized_symbol(symbol)
+            symbols.extend([symbol] * count)
+            numbers.extend([number] * count)
+        n_atoms = sum(counts)
+        if n_atoms <= 0:
+            raise ValueError("XDATCAR variable frame has no atoms")
+
+        marker = handle.readline()
+        if not marker.startswith("Direct configuration="):
+            raise ValueError("XDATCAR variable frame is missing Direct configuration marker")
+        text = "".join(handle.readline() for _ in range(n_atoms))
+        scaled = np.fromstring(text, sep=" ", dtype=np.float64)
+        expected = n_atoms * 3
+        if scaled.size != expected:
+            raise ValueError(f"Expected {expected} XDATCAR coordinates, found {scaled.size}")
+        positions = np.asarray(scaled.reshape((n_atoms, 3)) @ cell, dtype="<f4")
+        return FrameData(
+            positions=positions,
+            numbers=np.asarray(numbers, dtype=np.int32),
+            symbols=tuple(symbols),
+            cell=np.asarray(cell, dtype="<f4"),
             pbc=(True, True, True),
         )
 
@@ -2135,18 +2679,397 @@ class StructureService:
         except Exception as exc:
             raise AppError("STRUCTURE_PARSE_FAILED", f"ASE could not parse {path.name}: {exc}", 400) from exc
 
-    def _read_plain_xyz_frame_range(self, path: Path, index: FastXyzIndex, start: int, end: int) -> list[FrameData]:
+    def _read_plain_xyz_frame_range(
+        self,
+        path: Path,
+        index: FastXyzIndex,
+        start: int,
+        end: int,
+        summary: StructureSummary | None = None,
+        profile: dict[str, Any] | None = None,
+    ) -> list[FrameData]:
         frames: list[FrameData] = []
         try:
+            stable_stride = _stable_plain_xyz_frame_stride(index)
+            if (
+                summary is not None
+                and summary.topology_stable
+                and 0 <= start < end <= len(index.frame_offsets)
+                and index.complete
+            ):
+                _profile_set(profile, "fixed_plain_xyz_path", "complete_index_sequential_np_fromstring")
+                return self._read_plain_xyz_fixed_frame_range(path, index, start, end, profile=profile)
+
+            if (
+                summary is not None
+                and summary.topology_stable
+                and stable_stride is not None
+                and 0 <= start < end
+            ):
+                _profile_set(profile, "fixed_plain_xyz_path", "stable_stride_sequential_np_fromstring")
+                return self._read_plain_xyz_fixed_frame_range(
+                    path,
+                    index,
+                    start,
+                    end,
+                    profile=profile,
+                    stable_stride=stable_stride,
+                )
+
             with path.open("r", encoding="utf-8") as handle:
-                for frame_index in range(start, end):
-                    handle.seek(index.frame_offsets[frame_index])
-                    frames.append(self._read_plain_xyz_frame_from_handle(handle, path, frame_index))
+                if index.complete:
+                    for frame_index in range(start, end):
+                        handle.seek(index.frame_offsets[frame_index])
+                        frames.append(self._read_plain_xyz_frame_from_handle(handle, path, frame_index))
+                    return frames
+
+                if stable_stride is not None:
+                    base_offset = index.frame_offsets[0]
+                    for frame_index in range(start, end):
+                        handle.seek(base_offset + frame_index * stable_stride)
+                        frames.append(self._read_plain_xyz_frame_from_handle(handle, path, frame_index))
+                    return frames
+
+                # The fast preview index only stores sample offsets, not a
+                # complete frame-index -> offset map. If constant stride cannot
+                # be proven, fall back to a correct forward scan from frame 0.
+                file_size = path.stat().st_size
+                handle.seek(index.frame_offsets[0])
+                for frame_index in range(0, end):
+                    if handle.tell() >= file_size:
+                        break
+                    frame = self._read_plain_xyz_frame_from_handle(handle, path, frame_index)
+                    if frame_index >= start:
+                        frames.append(frame)
             return frames
         except AppError:
             raise
         except Exception as exc:
             raise AppError("STRUCTURE_PARSE_FAILED", f"ASE could not parse {path.name}: {exc}", 400) from exc
+
+    def _read_plain_xyz_fixed_frame_range(
+        self,
+        path: Path,
+        index: FastXyzIndex,
+        start: int,
+        end: int,
+        profile: dict[str, Any] | None = None,
+        stable_stride: int | None = None,
+    ) -> list[FrameData]:
+        with path.open("r", encoding="utf-8") as handle:
+            start_offset = index.frame_offsets[start] if index.complete else index.frame_offsets[0] + start * stable_stride
+            t_seek_0 = _profile_start(profile)
+            handle.seek(start_offset)
+            _profile_add_ms(profile, "fixed_plain_xyz_seek_ms", t_seek_0)
+            frames: list[FrameData] = []
+            reference_symbols: tuple[str, ...] | None = None
+            reference_numbers: np.ndarray | None = None
+            for frame_index in range(start, end):
+                frame, reference_symbols, reference_numbers = self._read_plain_xyz_fixed_frame_from_handle(
+                    handle,
+                    frame_index,
+                    reference_symbols,
+                    reference_numbers,
+                    profile=profile,
+                )
+                frames.append(frame)
+            return frames
+
+    def _try_build_direct_fixed_binary_payload(
+        self,
+        *,
+        path: Path,
+        summary: StructureSummary,
+        start: int,
+        count: int,
+        n_frames_total: int,
+        profile: dict[str, Any] | None,
+    ) -> bytes | None:
+        xdatcar_payload = self._try_build_xdatcar_fixed_binary_payload(
+            path=path,
+            summary=summary,
+            start=start,
+            count=count,
+            n_frames_total=n_frames_total,
+            profile=profile,
+        )
+        if xdatcar_payload is not None:
+            return xdatcar_payload
+        return self._try_build_plain_xyz_fixed_binary_payload(
+            path=path,
+            summary=summary,
+            start=start,
+            count=count,
+            n_frames_total=n_frames_total,
+            profile=profile,
+        )
+
+    def _try_build_plain_xyz_fixed_binary_payload(
+        self,
+        *,
+        path: Path,
+        summary: StructureSummary,
+        start: int,
+        count: int,
+        n_frames_total: int,
+        profile: dict[str, Any] | None,
+    ) -> bytes | None:
+        index = summary.fast_xyz_index
+        if (
+            index is None
+            or index.detected_format != "xyz"
+            or not summary.topology_stable
+            or summary.last_frame_data is None
+            or count <= 0
+        ):
+            return None
+
+        stable_stride = _stable_plain_xyz_frame_stride(index)
+        if index.complete:
+            if start < 0 or start + count > len(index.frame_offsets):
+                return None
+            start_offset = index.frame_offsets[start]
+            direct_path = "complete_index_direct_arrays"
+        elif stable_stride is not None:
+            start_offset = index.frame_offsets[0] + start * stable_stride
+            direct_path = "stable_stride_direct_arrays"
+        else:
+            return None
+
+        t_read_0 = _profile_start(profile)
+        arrays = self._read_plain_xyz_fixed_chunk_arrays(
+            path=path,
+            start_offset=start_offset,
+            count=count,
+            n_atoms=summary.n_atoms,
+            symbols=summary.last_frame_data.symbols,
+            numbers=summary.last_frame_data.numbers,
+            profile=profile,
+        )
+        _profile_add_ms(profile, "read_frame_range_ms", t_read_0)
+        _profile_set(profile, "read_path", f"fast_xyz_direct_arrays:{index.detected_format}")
+        _profile_set(profile, "fixed_plain_xyz_path", direct_path)
+
+        t_build_0 = _profile_start(profile)
+        payload = self._build_fixed_binary_payload_from_arrays(
+            path=path,
+            arrays=arrays,
+            start=start,
+            n_frames_total=n_frames_total,
+            detected_format=summary.detected_format,
+            profile=profile,
+        )
+        _profile_add_ms(profile, "build_payload_total_ms", t_build_0)
+        return payload
+
+    def _try_build_xdatcar_fixed_binary_payload(
+        self,
+        *,
+        path: Path,
+        summary: StructureSummary,
+        start: int,
+        count: int,
+        n_frames_total: int,
+        profile: dict[str, Any] | None,
+    ) -> bytes | None:
+        index = summary.fast_xdatcar_index
+        if index is None or not summary.topology_stable or count <= 0:
+            return None
+        if start < 0 or start + count > len(index.frame_offsets):
+            return None
+
+        t_read_0 = _profile_start(profile)
+        arrays = self._read_xdatcar_fixed_chunk_arrays(
+            path=path,
+            index=index,
+            start=start,
+            count=count,
+            profile=profile,
+        )
+        _profile_add_ms(profile, "read_frame_range_ms", t_read_0)
+        _profile_set(profile, "read_path", "fast_xdatcar_direct_arrays")
+
+        t_build_0 = _profile_start(profile)
+        payload = self._build_fixed_binary_payload_from_arrays(
+            path=path,
+            arrays=arrays,
+            start=start,
+            n_frames_total=n_frames_total,
+            detected_format=summary.detected_format,
+            profile=profile,
+        )
+        _profile_add_ms(profile, "build_payload_total_ms", t_build_0)
+        return payload
+
+    def _read_plain_xyz_fixed_chunk_arrays(
+        self,
+        *,
+        path: Path,
+        start_offset: int,
+        count: int,
+        n_atoms: int,
+        symbols: tuple[str, ...],
+        numbers: np.ndarray,
+        profile: dict[str, Any] | None,
+    ) -> StructureChunkArrays:
+        if n_atoms <= 0 or len(symbols) != n_atoms:
+            raise AppError("STRUCTURE_PARSE_FAILED", f"Invalid fixed XYZ topology in {path.name}", 400)
+
+        coord_segments: list[str] = []
+        coord_starts: list[int] | None = None
+        energy = np.full((count,), np.nan, dtype="<f4")
+        fmax = np.full((count,), np.nan, dtype="<f4")
+
+        with path.open("r", encoding="utf-8") as handle:
+            t_seek_0 = _profile_start(profile)
+            handle.seek(start_offset)
+            _profile_add_ms(profile, "fixed_plain_xyz_seek_ms", t_seek_0)
+
+            for local_index in range(count):
+                t_header_0 = _profile_start(profile)
+                atom_count = int(handle.readline().strip())
+                comment = handle.readline()
+                _profile_add_ms(profile, "fixed_plain_xyz_header_read_ms", t_header_0)
+                if atom_count != n_atoms:
+                    raise ValueError(f"Unexpected atom count change in frame chunk at local index {local_index}")
+                if comment == "":
+                    raise ValueError(f"Missing comment line in frame chunk at local index {local_index}")
+
+                parsed_energy = _extract_plain_xyz_comment_energy(comment)
+                parsed_fmax = _extract_plain_xyz_comment_fmax(comment)
+                if parsed_energy is not None:
+                    energy[local_index] = parsed_energy
+                if parsed_fmax is not None:
+                    fmax[local_index] = parsed_fmax
+
+                t_read_0 = _profile_start(profile)
+                atom_lines = [handle.readline() for _ in range(n_atoms)]
+                _profile_add_ms(profile, "fixed_plain_xyz_atom_readline_ms", t_read_0)
+                if any(line == "" for line in atom_lines):
+                    raise ValueError(f"Unexpected end of file in frame chunk at local index {local_index}")
+
+                t_split_0 = _profile_start(profile)
+                if coord_starts is None:
+                    coord_starts = []
+                    for atom_index, atom_line in enumerate(atom_lines):
+                        symbol_token, coord_start = _plain_xyz_symbol_and_coord_start(atom_line)
+                        symbol = _normalize_symbol(symbol_token)
+                        if symbol != symbols[atom_index]:
+                            raise ValueError(f"Unexpected atom symbol in frame chunk at local index {local_index}")
+                        coord_starts.append(coord_start)
+                        coord_segments.append(atom_line[coord_start:].strip())
+                else:
+                    for atom_index, atom_line in enumerate(atom_lines):
+                        coord_start = coord_starts[atom_index]
+                        symbol = symbols[atom_index]
+                        if (
+                            len(atom_line) <= coord_start
+                            or not atom_line.startswith(symbol)
+                            or not atom_line[len(symbol)].isspace()
+                        ):
+                            symbol_token, coord_text = _split_plain_xyz_atom_line(atom_line)
+                            if _normalize_symbol(symbol_token) != symbol:
+                                raise ValueError(f"Unexpected atom symbol in frame chunk at local index {local_index}")
+                            coord_segments.append(coord_text)
+                        else:
+                            coord_segments.append(atom_line[coord_start:].strip())
+                _profile_add_ms(profile, "fixed_plain_xyz_split_ms", t_split_0)
+
+        t_join_0 = _profile_start(profile)
+        coord_text = "\n".join(coord_segments)
+        _profile_add_ms(profile, "fixed_plain_xyz_coord_join_ms", t_join_0)
+        t_parse_0 = _profile_start(profile)
+        positions_flat = np.fromstring(coord_text, sep=" ", dtype=np.float32)
+        _profile_add_ms(profile, "fixed_plain_xyz_np_fromstring_ms", t_parse_0)
+        if positions_flat.size != count * n_atoms * 3:
+            raise ValueError("Invalid fixed XYZ coordinate block")
+
+        positions = positions_flat.reshape((count, n_atoms, 3))
+        cells = np.zeros((count, 3, 3), dtype="<f4")
+        tags = np.zeros((count, n_atoms), dtype="<i4")
+        fixed_mask = np.zeros((count, n_atoms), dtype=np.uint8)
+
+        return StructureChunkArrays(
+            count=count,
+            positions=positions,
+            cells=cells,
+            tags=tags,
+            fixed_mask=fixed_mask,
+            energy=energy,
+            fmax=fmax,
+            symbols=symbols,
+            numbers=np.asarray(numbers, dtype=np.int32),
+            pbc=(False, False, False),
+        )
+
+    def _read_xdatcar_fixed_chunk_arrays(
+        self,
+        *,
+        path: Path,
+        index: FastXdatcarIndex,
+        start: int,
+        count: int,
+        profile: dict[str, Any] | None,
+    ) -> StructureChunkArrays:
+        if index.n_atoms <= 0 or len(index.symbols) != index.n_atoms or len(index.numbers) != index.n_atoms:
+            raise AppError("STRUCTURE_PARSE_FAILED", f"Invalid XDATCAR topology in {path.name}", 400)
+
+        coord_segments: list[str] = []
+        with path.open("r", encoding="utf-8") as handle:
+            for local_index in range(count):
+                frame_index = start + local_index
+                try:
+                    frame_offset = index.frame_offsets[frame_index]
+                except IndexError:
+                    raise ValueError(f"XDATCAR frame index is outside range: {frame_index}") from None
+                t_seek_0 = _profile_start(profile)
+                handle.seek(frame_offset)
+                _profile_add_ms(profile, "fixed_xdatcar_seek_ms", t_seek_0)
+
+                t_read_0 = _profile_start(profile)
+                frame_lines = [handle.readline() for _ in range(index.n_atoms)]
+                _profile_add_ms(profile, "fixed_xdatcar_coord_readline_ms", t_read_0)
+                if any(line == "" for line in frame_lines):
+                    raise ValueError(f"Unexpected end of XDATCAR frame chunk at local index {local_index}")
+                coord_segments.extend(line.strip() for line in frame_lines)
+
+        t_join_0 = _profile_start(profile)
+        coord_text = "\n".join(coord_segments)
+        _profile_add_ms(profile, "fixed_xdatcar_coord_join_ms", t_join_0)
+        t_parse_0 = _profile_start(profile)
+        scaled_flat = np.fromstring(coord_text, sep=" ", dtype=np.float32)
+        _profile_add_ms(profile, "fixed_xdatcar_np_fromstring_ms", t_parse_0)
+        expected = count * index.n_atoms * 3
+        if scaled_flat.size != expected:
+            raise ValueError(f"Expected {expected} XDATCAR coordinates, found {scaled_flat.size}")
+
+        t_transform_0 = _profile_start(profile)
+        scaled = scaled_flat.reshape((count, index.n_atoms, 3))
+        cell = np.asarray(index.cell, dtype="<f4")
+        positions = np.asarray(scaled @ cell.astype(np.float32), dtype="<f4")
+        cells = np.broadcast_to(cell, (count, 3, 3)).copy()
+        _profile_add_ms(profile, "fixed_xdatcar_transform_ms", t_transform_0)
+
+        tags = np.zeros((count, index.n_atoms), dtype="<i4")
+        fixed_mask = np.zeros((count, index.n_atoms), dtype=np.uint8)
+        for atom_index in index.fixed_indices:
+            if 0 <= atom_index < index.n_atoms:
+                fixed_mask[:, atom_index] = 1
+        energy = np.full((count,), np.nan, dtype="<f4")
+        fmax = np.full((count,), np.nan, dtype="<f4")
+
+        return StructureChunkArrays(
+            count=count,
+            positions=positions,
+            cells=cells,
+            tags=tags,
+            fixed_mask=fixed_mask,
+            energy=energy,
+            fmax=fmax,
+            symbols=index.symbols,
+            numbers=np.asarray(index.numbers, dtype=np.int32),
+            pbc=(True, True, True),
+        )
 
     def _read_plain_xyz_frame_from_handle(self, handle: Any, path: Path, frame_index: int) -> FrameData:
         atom_count = int(handle.readline().strip())
@@ -2170,6 +3093,90 @@ class StructureService:
             pbc=(False, False, False),
             energy=_extract_plain_xyz_comment_energy(comment),
             fmax=_extract_plain_xyz_comment_fmax(comment),
+        )
+
+    def _read_plain_xyz_fixed_frame_from_handle(
+        self,
+        handle: Any,
+        frame_index: int,
+        reference_symbols: tuple[str, ...] | None,
+        reference_numbers: np.ndarray | None,
+        profile: dict[str, Any] | None = None,
+    ) -> tuple[FrameData, tuple[str, ...], np.ndarray]:
+        t_header_0 = _profile_start(profile)
+        atom_count = int(handle.readline().strip())
+        comment = handle.readline()
+        _profile_add_ms(profile, "fixed_plain_xyz_header_read_ms", t_header_0)
+        if comment == "":
+            raise ValueError(f"Missing comment line at frame {frame_index}")
+
+        coord_segments: list[str] = []
+        coord_segments_extend = coord_segments.append
+
+        if reference_symbols is None or reference_numbers is None:
+            symbols_list: list[str] = []
+            numbers = np.empty((atom_count,), dtype=np.int32)
+            for atom_index in range(atom_count):
+                t_readline_0 = _profile_start(profile)
+                atom_line = handle.readline()
+                _profile_add_ms(profile, "fixed_plain_xyz_atom_readline_ms", t_readline_0)
+                if atom_line == "":
+                    raise ValueError(f"Unexpected end of file in frame {frame_index}")
+                t_split_0 = _profile_start(profile)
+                symbol_token, coord_text = _split_plain_xyz_atom_line(atom_line)
+                _profile_add_ms(profile, "fixed_plain_xyz_split_ms", t_split_0)
+                t_symbol_0 = _profile_start(profile)
+                symbol = _normalize_symbol(symbol_token)
+                symbols_list.append(symbol)
+                numbers[atom_index] = _atomic_number_from_normalized_symbol(symbol)
+                _profile_add_ms(profile, "fixed_plain_xyz_symbol_parse_ms", t_symbol_0)
+                coord_segments_extend(coord_text)
+            reference_symbols = tuple(symbols_list)
+            reference_numbers = numbers
+        else:
+            if atom_count != len(reference_symbols):
+                raise ValueError(f"Unexpected atom count change in frame {frame_index}")
+            for atom_index in range(atom_count):
+                t_readline_0 = _profile_start(profile)
+                atom_line = handle.readline()
+                _profile_add_ms(profile, "fixed_plain_xyz_atom_readline_ms", t_readline_0)
+                if atom_line == "":
+                    raise ValueError(f"Unexpected end of file in frame {frame_index}")
+                t_split_0 = _profile_start(profile)
+                _symbol_token, coord_text = _split_plain_xyz_atom_line(atom_line)
+                _profile_add_ms(profile, "fixed_plain_xyz_split_ms", t_split_0)
+                coord_segments_extend(coord_text)
+
+        t_join_0 = _profile_start(profile)
+        coord_text = "\n".join(coord_segments)
+        _profile_add_ms(profile, "fixed_plain_xyz_coord_join_ms", t_join_0)
+        t_parse_0 = _profile_start(profile)
+        positions_flat = np.fromstring(coord_text, sep=" ", dtype=np.float32)
+        _profile_add_ms(profile, "fixed_plain_xyz_np_fromstring_ms", t_parse_0)
+        if positions_flat.size != atom_count * 3:
+            raise ValueError(f"Invalid coordinate block in frame {frame_index}")
+        t_reshape_0 = _profile_start(profile)
+        positions = positions_flat.reshape((atom_count, 3))
+        _profile_add_ms(profile, "fixed_plain_xyz_reshape_ms", t_reshape_0)
+
+        t_frame_0 = _profile_start(profile)
+        numbers_copy = reference_numbers.copy()
+        t_frame_build_0 = _profile_start(profile)
+        frame = FrameData(
+            positions=positions,
+            numbers=numbers_copy,
+            symbols=reference_symbols,
+            cell=np.zeros((3, 3), dtype="<f4"),
+            pbc=(False, False, False),
+            energy=_extract_plain_xyz_comment_energy(comment),
+            fmax=_extract_plain_xyz_comment_fmax(comment),
+        )
+        _profile_add_ms(profile, "fixed_plain_xyz_numbers_copy_ms", t_frame_0)
+        _profile_add_ms(profile, "fixed_plain_xyz_frame_build_ms", t_frame_build_0)
+        return (
+            frame,
+            reference_symbols,
+            reference_numbers,
         )
 
     def _read_extxyz_frame_slice(self, path: Path, offset: int, length: int) -> Atoms | FrameData:
@@ -2336,9 +3343,16 @@ class StructureService:
             scaled_positions: list[list[float]] = []
             symbols: list[str] = []
             numbers: list[int] = []
+            atom_id_to_index: dict[str, int] = {}
+            fixed_indices: set[int] = set()
+            restricted_object_ids: set[str] = set()
 
             for node in system:
                 if node.tag == "Atom3d":
+                    atom_index = len(symbols)
+                    atom_id = node.get("ID")
+                    if atom_id:
+                        atom_id_to_index[atom_id] = atom_index
                     symbol_raw = node.get("Components")
                     if not symbol_raw:
                         raise FastParserUnsupported("XSD atom symbol is missing")
@@ -2357,6 +3371,8 @@ class StructureService:
                     symbols.append(symbol)
                     numbers.append(number)
                     scaled_positions.append(coords)
+                    if _xsd_restricts_full_position(node.get("RestrictedProperties")):
+                        fixed_indices.add(atom_index)
                 elif node.tag == "SpaceGroup":
                     for key in ("AVector", "BVector", "CVector"):
                         vector = node.get(key)
@@ -2366,9 +3382,17 @@ class StructureService:
                         if len(coords) != 3:
                             raise FastParserUnsupported("XSD cell vector is invalid")
                         cell_rows.append(coords)
+                elif node.tag == "CompleteRestriction":
+                    if _xsd_restricts_full_position(node.get("RestrictsProperties")):
+                        restricted_object_ids.update(_parse_xsd_restricts_objects(node.get("RestrictsObjects")))
 
             if len(cell_rows) != 3 or not symbols:
                 raise FastParserUnsupported("XSD periodic frame is incomplete")
+
+            for atom_id in restricted_object_ids:
+                atom_index = atom_id_to_index.get(atom_id)
+                if atom_index is not None:
+                    fixed_indices.add(atom_index)
 
             cell = np.asarray(cell_rows, dtype="<f4")
             scaled = np.asarray(scaled_positions, dtype=np.float64)
@@ -2379,6 +3403,7 @@ class StructureService:
                 symbols=tuple(symbols),
                 cell=cell,
                 pbc=(True, True, True),
+                fixed_indices=tuple(sorted(fixed_indices)),
             )
         except FastParserUnsupported:
             raise
@@ -2479,39 +3504,56 @@ class StructureService:
         start: int,
         n_frames_total: int,
         detected_format: str | None,
+        profile: dict[str, Any] | None = None,
     ) -> bytes:
-        first = frames[0]
-        first_numbers = tuple(int(value) for value in first.get_atomic_numbers())
-        n_atoms = len(first)
-        count = len(frames)
+        t_normalize_0 = _profile_start(profile)
+        normalized = [_normalize_atoms_atom_level(frame) for frame in frames]
+        _profile_add_ms(profile, "normalize_atoms_ms", t_normalize_0)
+        return self._build_binary_payload_from_normalized(
+            path=path,
+            frames=normalized,
+            start=start,
+            n_frames_total=n_frames_total,
+            detected_format=detected_format,
+            profile=profile,
+        )
 
-        positions = np.empty((count, n_atoms, 3), dtype="<f4")
-        cells = np.empty((count, 3, 3), dtype="<f4")
-        tags = np.empty((count, n_atoms), dtype="<i4")
-        fixed_mask = np.zeros((count, n_atoms), dtype=np.uint8)
-        energy = np.full((count,), np.nan, dtype="<f4")
-        fmax = np.full((count,), np.nan, dtype="<f4")
+    def _build_binary_payload_from_data(
+        self,
+        *,
+        path: Path,
+        frames: list[FrameData],
+        start: int,
+        n_frames_total: int,
+        detected_format: str | None,
+        profile: dict[str, Any] | None = None,
+    ) -> bytes:
+        t_normalize_0 = _profile_start(profile)
+        normalized = [_normalize_frame_data_atom_level(frame) for frame in frames]
+        _profile_add_ms(profile, "normalize_frame_data_ms", t_normalize_0)
+        return self._build_binary_payload_from_normalized(
+            path=path,
+            frames=normalized,
+            start=start,
+            n_frames_total=n_frames_total,
+            detected_format=detected_format,
+            profile=profile,
+        )
 
-        for local_index, atoms in enumerate(frames):
-            numbers = tuple(int(value) for value in atoms.get_atomic_numbers())
-            if len(atoms) != n_atoms or numbers != first_numbers:
-                raise AppError(
-                    "STRUCTURE_TOPOLOGY_UNSTABLE",
-                    "Binary frame chunks require a stable atom count and element order",
-                    409,
-                )
-            positions[local_index] = np.asarray(atoms.get_positions(), dtype="<f4")
-            cells[local_index] = np.asarray(atoms.cell.array, dtype="<f4")
-            tags[local_index] = np.asarray(atoms.get_tags(), dtype="<i4")
-            for atom_index in _extract_fixed_indices(atoms):
-                fixed_mask[local_index, atom_index] = 1
-            frame_energy, frame_fmax = _extract_energy_fmax(atoms)
-            if frame_energy is not None:
-                energy[local_index] = frame_energy
-            if frame_fmax is not None:
-                fmax[local_index] = frame_fmax
-
-        arrays: dict[str, dict[str, Any]] = {}
+    def _build_fixed_binary_payload_from_arrays(
+        self,
+        *,
+        path: Path,
+        arrays: StructureChunkArrays,
+        start: int,
+        n_frames_total: int,
+        detected_format: str | None,
+        profile: dict[str, Any] | None = None,
+    ) -> bytes:
+        _profile_set(profile, "topology", "fixed")
+        count = arrays.count
+        n_atoms = int(arrays.positions.shape[1])
+        binary_arrays: dict[str, dict[str, Any]] = {}
         binary_parts: list[bytes] = []
         offset = 0
 
@@ -2523,8 +3565,10 @@ class StructureService:
                     binary_parts.append(b"\0" * padding_size)
                     offset += padding_size
             contiguous = np.ascontiguousarray(array)
+            t_add_array_0 = _profile_start(profile)
             data = contiguous.tobytes()
-            arrays[name] = {
+            _profile_add_ms(profile, "add_array_tobytes_ms", t_add_array_0)
+            binary_arrays[name] = {
                 "offset": offset,
                 "byte_length": len(data),
                 "shape": list(contiguous.shape),
@@ -2532,12 +3576,12 @@ class StructureService:
             binary_parts.append(data)
             offset += len(data)
 
-        add_array("positions", positions, alignment=4)
-        add_array("cells", cells, alignment=4)
-        add_array("tags", tags, alignment=4)
-        add_array("energy", energy, alignment=4)
-        add_array("fmax", fmax, alignment=4)
-        add_array("fixed_mask", fixed_mask, alignment=1)
+        add_array("positions", arrays.positions, alignment=4)
+        add_array("cells", arrays.cells, alignment=4)
+        add_array("tags", arrays.tags, alignment=4)
+        add_array("energy", arrays.energy, alignment=4)
+        add_array("fmax", arrays.fmax, alignment=4)
+        add_array("fixed_mask", arrays.fixed_mask, alignment=1)
 
         header = {
             "version": 1,
@@ -2551,21 +3595,152 @@ class StructureService:
             "path": str(path),
             "name": path.name,
             "format": detected_format,
-            "symbols": first.get_chemical_symbols(),
-            "numbers": [int(value) for value in first_numbers],
-            "pbc": [bool(value) for value in first.get_pbc()],
-            "arrays": arrays,
+            "symbols": list(arrays.symbols),
+            "numbers": [int(value) for value in np.asarray(arrays.numbers, dtype=np.int32).tolist()],
+            "pbc": [bool(value) for value in arrays.pbc],
+            "arrays": binary_arrays,
             "nan_means_null": ["energy", "fmax"],
         }
+        t_header_0 = _profile_start(profile)
         header_bytes = json.dumps(header, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
         header_padding = b"\0" * ((4 - (len(header_bytes) % 4)) % 4)
+        _profile_add_ms(profile, "header_json_ms", t_header_0)
 
-        return (
+        t_join_0 = _profile_start(profile)
+        payload = (
             STRUCTURE_BINARY_MAGIC
             + struct.pack("<I", len(header_bytes))
             + header_bytes
             + header_padding
             + b"".join(binary_parts)
+        )
+        _profile_add_ms(profile, "payload_join_ms", t_join_0)
+        _profile_set(profile, "payload_bytes", len(payload))
+        return payload
+
+    @staticmethod
+    def _are_normalized_frames_fixed_topology(frames: list[dict]) -> tuple[bool, int | None, tuple[int, ...] | None]:
+        if not frames:
+            return True, 0, ()
+        first_n = frames[0]["atom_count"]
+        first_numbers = frames[0]["numbers"]
+        for frame in frames[1:]:
+            if frame["atom_count"] != first_n or frame["numbers"] != first_numbers:
+                return False, None, None
+        return True, first_n, first_numbers
+
+    def _build_binary_payload_from_normalized(
+        self,
+        *,
+        path: Path,
+        frames: list[dict],
+        start: int,
+        n_frames_total: int,
+        detected_format: str | None,
+        profile: dict[str, Any] | None = None,
+    ) -> bytes:
+        if not frames:
+            raise AppError("FRAME_INDEX_OUT_OF_RANGE", "Requested frame chunk is empty", 404)
+
+        t_topology_0 = _profile_start(profile)
+        is_fixed, n_atoms, first_numbers = self._are_normalized_frames_fixed_topology(frames)
+        _profile_add_ms(profile, "topology_check_ms", t_topology_0)
+        count = len(frames)
+        _profile_set(profile, "topology", "fixed" if is_fixed else "variable")
+
+        if is_fixed and n_atoms is not None:
+            positions = np.empty((count, n_atoms, 3), dtype="<f4")
+            cells = np.empty((count, 3, 3), dtype="<f4")
+            tags = np.empty((count, n_atoms), dtype="<i4")
+            fixed_mask = np.zeros((count, n_atoms), dtype=np.uint8)
+            energy = np.full((count,), np.nan, dtype="<f4")
+            fmax = np.full((count,), np.nan, dtype="<f4")
+
+            t_array_fill_0 = _profile_start(profile)
+            for local_index, frame in enumerate(frames):
+                positions[local_index] = frame["positions"]
+                cells[local_index] = frame["cell"]
+                tags[local_index] = frame["tags"]
+                for atom_index in frame["fixed_indices"]:
+                    fixed_mask[local_index, atom_index] = 1
+                if frame["energy"] is not None:
+                    energy[local_index] = frame["energy"]
+                if frame["fmax"] is not None:
+                    fmax[local_index] = frame["fmax"]
+            _profile_add_ms(profile, "array_fill_ms", t_array_fill_0)
+
+            arrays: dict[str, dict[str, Any]] = {}
+            binary_parts: list[bytes] = []
+            offset = 0
+
+            def add_array(name: str, array: np.ndarray, *, alignment: int) -> None:
+                nonlocal offset
+                if alignment > 1:
+                    padding_size = (alignment - (offset % alignment)) % alignment
+                    if padding_size:
+                        binary_parts.append(b"\0" * padding_size)
+                        offset += padding_size
+                contiguous = np.ascontiguousarray(array)
+                t_add_array_0 = _profile_start(profile)
+                data = contiguous.tobytes()
+                _profile_add_ms(profile, "add_array_tobytes_ms", t_add_array_0)
+                arrays[name] = {
+                    "offset": offset,
+                    "byte_length": len(data),
+                    "shape": list(contiguous.shape),
+                }
+                binary_parts.append(data)
+                offset += len(data)
+
+            add_array("positions", positions, alignment=4)
+            add_array("cells", cells, alignment=4)
+            add_array("tags", tags, alignment=4)
+            add_array("energy", energy, alignment=4)
+            add_array("fmax", fmax, alignment=4)
+            add_array("fixed_mask", fixed_mask, alignment=1)
+
+            header = {
+                "version": 1,
+                "dtype": "float32-le",
+                "int_dtype": "int32-le",
+                "start": start,
+                "count": count,
+                "n_frames_total": n_frames_total,
+                "n_atoms": n_atoms,
+                "topology_stable": True,
+                "path": str(path),
+                "name": path.name,
+                "format": detected_format,
+                "symbols": frames[0]["symbols"],
+                "numbers": [int(value) for value in first_numbers],
+                "pbc": [bool(value) for value in frames[0]["pbc"]],
+                "arrays": arrays,
+                "nan_means_null": ["energy", "fmax"],
+            }
+            t_header_0 = _profile_start(profile)
+            header_bytes = json.dumps(header, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+            header_padding = b"\0" * ((4 - (len(header_bytes) % 4)) % 4)
+            _profile_add_ms(profile, "header_json_ms", t_header_0)
+
+            t_join_0 = _profile_start(profile)
+            payload = (
+                STRUCTURE_BINARY_MAGIC
+                + struct.pack("<I", len(header_bytes))
+                + header_bytes
+                + header_padding
+                + b"".join(binary_parts)
+            )
+            _profile_add_ms(profile, "payload_join_ms", t_join_0)
+            _profile_set(profile, "payload_bytes", len(payload))
+            return payload
+
+        # Variable-topology path
+        return self._build_variable_binary_payload(
+            path=path,
+            frames=frames,
+            start=start,
+            n_frames_total=n_frames_total,
+            detected_format=detected_format,
         )
 
     def _build_binary_payload_from_frames(
@@ -2576,6 +3751,7 @@ class StructureService:
         start: int,
         n_frames_total: int,
         detected_format: str | None,
+        profile: dict[str, Any] | None = None,
     ) -> bytes:
         if not frames:
             raise AppError("FRAME_INDEX_OUT_OF_RANGE", "Requested frame chunk is empty", 404)
@@ -2591,6 +3767,7 @@ class StructureService:
                 start=start,
                 n_frames_total=n_frames_total,
                 detected_format=detected_format,
+                profile=profile,
             )
 
         atoms_frames = []
@@ -2604,106 +3781,166 @@ class StructureService:
             start=start,
             n_frames_total=n_frames_total,
             detected_format=detected_format,
+            profile=profile,
         )
 
-    def _build_binary_payload_from_data(
+    def _build_variable_binary_payload(
         self,
         *,
         path: Path,
-        frames: list[FrameData],
+        frames: list[dict],
         start: int,
         n_frames_total: int,
         detected_format: str | None,
+        profile: dict[str, Any] | None = None,
     ) -> bytes:
-        first = frames[0]
-        first_numbers = tuple(int(value) for value in np.asarray(first.numbers, dtype=np.int32).tolist())
-        n_atoms = len(first_numbers)
+        _profile_set(profile, "topology", "variable")
         count = len(frames)
+        frame_atom_counts = np.empty((count,), dtype=np.int32)
+        total_atoms = 0
+        for index, frame in enumerate(frames):
+            n = frame["atom_count"]
+            frame_atom_counts[index] = n
+            total_atoms += n
 
-        positions = np.empty((count, n_atoms, 3), dtype="<f4")
+        if total_atoms <= 0:
+            raise AppError("STRUCTURE_PARSE_FAILED", "Variable-topology chunk has no atoms", 400)
+
+        positions = np.empty((total_atoms, 3), dtype="<f4")
+        numbers = np.empty((total_atoms,), dtype=np.int32)
+        tags = np.empty((total_atoms,), dtype="<i4")
+        fixed_mask = np.zeros((total_atoms,), dtype=np.uint8)
         cells = np.empty((count, 3, 3), dtype="<f4")
-        tags = np.empty((count, n_atoms), dtype="<i4")
-        fixed_mask = np.zeros((count, n_atoms), dtype=np.uint8)
+        pbc = np.empty((count, 3), dtype=np.uint8)
         energy = np.full((count,), np.nan, dtype="<f4")
         fmax = np.full((count,), np.nan, dtype="<f4")
 
+        t_array_fill_0 = _profile_start(profile)
+        offset = 0
         for local_index, frame in enumerate(frames):
-            numbers = tuple(int(value) for value in np.asarray(frame.numbers, dtype=np.int32).tolist())
-            if frame.positions.shape[0] != n_atoms or numbers != first_numbers:
-                raise AppError(
-                    "STRUCTURE_TOPOLOGY_UNSTABLE",
-                    "Binary frame chunks require a stable atom count and element order",
-                    409,
-                )
-            positions[local_index] = np.asarray(frame.positions, dtype="<f4")
-            cells[local_index] = np.asarray(frame.cell, dtype="<f4")
-            if frame.tags is None:
-                tags[local_index] = 0
-            else:
-                tags[local_index] = np.asarray(frame.tags, dtype="<i4")
-            for atom_index in frame.fixed_indices:
-                fixed_mask[local_index, atom_index] = 1
-            if frame.energy is not None:
-                energy[local_index] = frame.energy
-            if frame.fmax is not None:
-                fmax[local_index] = frame.fmax
+            n = frame["atom_count"]
+            end = offset + n
+            positions[offset:end] = frame["positions"]
+            numbers[offset:end] = frame["numbers_array"]
+            tags[offset:end] = frame["tags"]
+            for atom_index in frame["fixed_indices"]:
+                fixed_mask[offset + atom_index] = 1
+            cells[local_index] = frame["cell"]
+            pbc[local_index] = [1 if v else 0 for v in frame["pbc"]]
+            if frame["energy"] is not None:
+                energy[local_index] = frame["energy"]
+            if frame["fmax"] is not None:
+                fmax[local_index] = frame["fmax"]
+            offset = end
+        _profile_add_ms(profile, "array_fill_ms", t_array_fill_0)
 
         arrays: dict[str, dict[str, Any]] = {}
         binary_parts: list[bytes] = []
-        offset = 0
+        array_offset = 0
 
         def add_array(name: str, array: np.ndarray, *, alignment: int) -> None:
-            nonlocal offset
+            nonlocal array_offset
             if alignment > 1:
-                padding_size = (alignment - (offset % alignment)) % alignment
+                padding_size = (alignment - (array_offset % alignment)) % alignment
                 if padding_size:
                     binary_parts.append(b"\0" * padding_size)
-                    offset += padding_size
+                    array_offset += padding_size
             contiguous = np.ascontiguousarray(array)
+            t_add_array_0 = _profile_start(profile)
             data = contiguous.tobytes()
+            _profile_add_ms(profile, "add_array_tobytes_ms", t_add_array_0)
             arrays[name] = {
-                "offset": offset,
+                "offset": array_offset,
                 "byte_length": len(data),
                 "shape": list(contiguous.shape),
             }
             binary_parts.append(data)
-            offset += len(data)
+            array_offset += len(data)
 
+        add_array("frame_atom_counts", frame_atom_counts, alignment=4)
         add_array("positions", positions, alignment=4)
-        add_array("cells", cells, alignment=4)
+        add_array("numbers", numbers, alignment=4)
         add_array("tags", tags, alignment=4)
+        add_array("fixed_mask", fixed_mask, alignment=1)
+        add_array("cells", cells, alignment=4)
+        add_array("pbc", pbc, alignment=1)
         add_array("energy", energy, alignment=4)
         add_array("fmax", fmax, alignment=4)
-        add_array("fixed_mask", fixed_mask, alignment=1)
 
         header = {
             "version": 1,
             "dtype": "float32-le",
             "int_dtype": "int32-le",
+            "frame_encoding": "variable-atoms-v1",
             "start": start,
             "count": count,
             "n_frames_total": n_frames_total,
-            "n_atoms": n_atoms,
-            "topology_stable": True,
+            "n_atoms": 0,
+            "topology_stable": False,
             "path": str(path),
             "name": path.name,
             "format": detected_format,
-            "symbols": list(first.symbols),
-            "numbers": [int(value) for value in first_numbers],
-            "pbc": [bool(value) for value in first.pbc],
+            "symbols": [],
+            "numbers": [],
+            "pbc": [False, False, False],
             "arrays": arrays,
             "nan_means_null": ["energy", "fmax"],
         }
+        t_header_0 = _profile_start(profile)
         header_bytes = json.dumps(header, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
         header_padding = b"\0" * ((4 - (len(header_bytes) % 4)) % 4)
+        _profile_add_ms(profile, "header_json_ms", t_header_0)
 
-        return (
+        t_join_0 = _profile_start(profile)
+        payload = (
             STRUCTURE_BINARY_MAGIC
             + struct.pack("<I", len(header_bytes))
             + header_bytes
             + header_padding
             + b"".join(binary_parts)
         )
+        _profile_add_ms(profile, "payload_join_ms", t_join_0)
+        _profile_set(profile, "payload_bytes", len(payload))
+        return payload
+
+
+def _normalize_atoms_atom_level(atoms: Atoms) -> dict[str, Any]:
+    numbers_array = np.asarray(atoms.get_atomic_numbers(), dtype=np.int32)
+    n_atoms = len(atoms)
+    fixed_indices = tuple(_extract_fixed_indices(atoms))
+    energy, fmax = _extract_energy_fmax(atoms)
+    return {
+        "atom_count": n_atoms,
+        "positions": np.asarray(atoms.get_positions(), dtype="<f4"),
+        "numbers": tuple(int(value) for value in numbers_array.tolist()),
+        "numbers_array": numbers_array,
+        "symbols": atoms.get_chemical_symbols(),
+        "cell": np.asarray(atoms.cell.array, dtype="<f4"),
+        "pbc": tuple(bool(value) for value in atoms.get_pbc()),
+        "tags": np.asarray(atoms.get_tags(), dtype="<i4"),
+        "fixed_indices": fixed_indices,
+        "energy": energy,
+        "fmax": fmax,
+    }
+
+
+def _normalize_frame_data_atom_level(frame: FrameData) -> dict[str, Any]:
+    numbers_array = np.asarray(frame.numbers, dtype=np.int32)
+    n_atoms = int(numbers_array.shape[0])
+    tags = np.zeros((n_atoms,), dtype="<i4") if frame.tags is None else np.asarray(frame.tags, dtype="<i4")
+    return {
+        "atom_count": n_atoms,
+        "positions": np.asarray(frame.positions, dtype="<f4"),
+        "numbers": tuple(int(value) for value in numbers_array.tolist()),
+        "numbers_array": numbers_array,
+        "symbols": list(frame.symbols),
+        "cell": np.asarray(frame.cell, dtype="<f4"),
+        "pbc": tuple(bool(value) for value in frame.pbc),
+        "tags": tags,
+        "fixed_indices": tuple(int(value) for value in frame.fixed_indices),
+        "energy": frame.energy,
+        "fmax": frame.fmax,
+    }
 
 
 def _frame_atom_count(frame: Atoms | FrameData) -> int:
@@ -2967,6 +4204,30 @@ def _is_xsd_format(path: Path, fmt: str | None) -> bool:
     return path.suffix.lower() == ".xsd"
 
 
+def _xsd_restricts_full_position(value: str | None) -> bool:
+    if not value:
+        return False
+    properties = [part.strip().lower() for part in value.split(",") if part.strip()]
+    return "fractionalxyz" in properties or "xyz" in properties
+
+
+def _parse_xsd_restricts_objects(value: str | None) -> set[str]:
+    if not value:
+        return set()
+    _, _, tail = value.partition(":")
+    body = tail or value
+    object_ids: set[str] = set()
+    for part in body.split(","):
+        item = part.strip()
+        if not item:
+            continue
+        if "+" in item:
+            item = item.split("+", 1)[0].strip()
+        if item:
+            object_ids.add(item)
+    return object_ids
+
+
 def _is_dmol_arc_format(path: Path, fmt: str | None) -> bool:
     normalized = _normalized_format(fmt)
     if normalized is not None:
@@ -3021,6 +4282,47 @@ def _extract_plain_xyz_comment_fmax(comment: str) -> float | None:
     return _safe_float(match.group(1).replace("D", "E").replace("d", "e"))
 
 
+def _stable_plain_xyz_frame_stride(index: FastXyzIndex) -> int | None:
+    if not index.frame_lengths or not index.atom_counts:
+        return None
+    first_length = index.frame_lengths[0]
+    first_atom_count = index.atom_counts[0]
+    if first_length <= 0 or first_atom_count <= 0:
+        return None
+    if any(length != first_length for length in index.frame_lengths):
+        return None
+    if any(atom_count != first_atom_count for atom_count in index.atom_counts):
+        return None
+    if not index.complete:
+        if index.n_frames is None or index.last_frame_offset is None:
+            return None
+        expected_last_offset = index.frame_offsets[0] + (index.n_frames - 1) * first_length
+        if expected_last_offset != index.last_frame_offset:
+            return None
+    return first_length
+
+
+def _split_plain_xyz_atom_line(line: str) -> tuple[str, str]:
+    parts = line.strip().split(maxsplit=1)
+    if len(parts) != 2:
+        raise ValueError("Invalid atom line")
+    return parts[0], parts[1]
+
+
+def _plain_xyz_symbol_and_coord_start(line: str) -> tuple[str, int]:
+    stripped_start = len(line) - len(line.lstrip())
+    cursor = stripped_start
+    while cursor < len(line) and not line[cursor].isspace():
+        cursor += 1
+    if cursor == stripped_start:
+        raise ValueError("Invalid atom line")
+    while cursor < len(line) and line[cursor].isspace():
+        cursor += 1
+    if cursor >= len(line):
+        raise ValueError("Invalid atom line")
+    return line[stripped_start:cursor].strip(), cursor
+
+
 def _is_force_property_name(name: str) -> bool:
     normalized = name.lower()
     return normalized == "forces" or normalized == "force" or normalized.endswith("_forces") or normalized.endswith("_force")
@@ -3057,6 +4359,17 @@ def _parse_vasp_scaling_factor(line: str) -> np.ndarray:
     if values.size == 3 and any(value < 0.0 for value in values):
         raise ValueError("VASP three-value scaling factors must be positive")
     return values
+
+
+def _xdatcar_frame_number_from_marker(line: str) -> int | None:
+    match = re.search(r"\bDirect\s+configuration\s*=\s*(\d+)", line, re.IGNORECASE)
+    if match is None:
+        return None
+    try:
+        value = int(match.group(1))
+    except ValueError:
+        return None
+    return value if value > 0 else None
 
 
 def _safe_float(value: Any) -> float | None:

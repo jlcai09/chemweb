@@ -11,6 +11,7 @@ class SystemInfo(BaseModel):
     python_version: str
     scheduler: str
     workspace_root: str
+    max_upload_size_mb: int
 
 
 class SystemIdentity(BaseModel):

@@ -10,6 +10,22 @@ def _args(reuse_existing: str) -> Namespace:
     return Namespace(reuse_existing=reuse_existing)
 
 
+def test_cli_transfer_shim_hidden_mode_bypasses_regular_parser(monkeypatch) -> None:
+    calls: list[list[str]] = []
+
+    def fake_transfer_shim(args):
+        calls.append(list(args))
+        return 7
+
+    monkeypatch.setattr(cli, "_run_terminal_transfer_shim", fake_transfer_shim)
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["--terminal-transfer-shim", "download", "/tmp/shim", "result.out"])
+
+    assert exc.value.code == 7
+    assert calls == [["download", "/tmp/shim", "result.out"]]
+
+
 def test_cli_reuses_existing_chemssh_with_same_workspace(tmp_path: Path, monkeypatch, capsys) -> None:
     existing = cli.ExistingChemSSHServer(
         url="http://127.0.0.1:8888",

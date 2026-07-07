@@ -36,6 +36,7 @@ import { ElMessage } from 'element-plus'
 import { Refresh } from '@element-plus/icons-vue'
 import { API_BASE, apiUrl, getAuthToken } from '../../api/http'
 import { activatePlugin, listPlugins, type PluginManifest, type PluginPanel } from '../../api/plugins'
+import type { FilePreviewProvider } from '../../api/filePreviewProviders'
 import { t } from '../../i18n'
 
 const props = defineProps<{
@@ -49,6 +50,8 @@ const props = defineProps<{
 const emit = defineEmits<{
   'payload-change': [payload: Record<string, unknown>]
   'title-change': [title: string]
+  'register-provider': [provider: FilePreviewProvider, ownerId: string]
+  'unregister-provider': [providerId: string, ownerId: string]
 }>()
 
 const frameRef = ref<HTMLIFrameElement | null>(null)
@@ -60,6 +63,7 @@ const activeAssetPath = ref(props.assetUrl ?? '')
 const activeAssetUrl = ref(props.assetUrl ? apiUrl(props.assetUrl) : '')
 const activeApiBase = ref(props.apiBase ?? '')
 const activeTitle = ref('')
+const registeredProviderIds = ref<string[]>([])
 
 const panelOptions = computed(() => {
   return plugins.value.flatMap(plugin => (plugin.panels ?? []).map(panel => ({ plugin, panel })))
@@ -76,6 +80,7 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   window.removeEventListener('message', handlePluginMessage)
+  cleanupRegisteredProviders()
 })
 
 watch(
@@ -106,6 +111,7 @@ async function openPanel(pluginId: string, panelId: string) {
     const panel = manifest?.panels.find(item => item.id === panelId)
     const activation = await activatePlugin(pluginId)
     const activatedPanel = activation.panels.find(item => item.id === panelId) ?? panel
+    cleanupRegisteredProviders()
     activePluginId.value = pluginId
     activePanelId.value = panelId
     activeAssetPath.value = activation.asset_url
@@ -146,9 +152,26 @@ function sendInit() {
 }
 
 function handlePluginMessage(event: MessageEvent) {
+  if (event.source !== frameRef.value?.contentWindow) return
   if (!isTrustedPluginOrigin(event.origin)) return
-  // Canvas plugin windows currently initialize plugins. Preview provider registration
-  // remains in Workspace until the file manager provider flow is fully shared.
+  const data = event.data as { type?: string; provider?: FilePreviewProvider; providerId?: string } | null
+  if (data?.type === 'chemssh:file-manager:register-preview-provider' && data.provider) {
+    if (!registeredProviderIds.value.includes(data.provider.id)) {
+      registeredProviderIds.value = [...registeredProviderIds.value, data.provider.id]
+    }
+    emit('register-provider', data.provider, props.instanceId)
+  } else if (data?.type === 'chemssh:file-manager:unregister-preview-provider' && data.providerId) {
+    if (!registeredProviderIds.value.includes(data.providerId)) return
+    registeredProviderIds.value = registeredProviderIds.value.filter(id => id !== data.providerId)
+    emit('unregister-provider', data.providerId, props.instanceId)
+  }
+}
+
+function cleanupRegisteredProviders() {
+  for (const providerId of registeredProviderIds.value) {
+    emit('unregister-provider', providerId, props.instanceId)
+  }
+  registeredProviderIds.value = []
 }
 
 function isTrustedPluginOrigin(origin: string) {

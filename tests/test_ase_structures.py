@@ -18,6 +18,7 @@ from backend.app.core.config import (
     AseViewerConfig,
     BrotliConfig,
     CompressionConfig,
+    ServerConfig,
     Settings,
     ViewerConfig,
     WorkspaceConfig,
@@ -37,12 +38,31 @@ def make_client(
     *,
     max_points_json: int = 200_000,
     max_file_size_mb: int = 50,
+    debug: bool = False,
 ) -> TestClient:
     settings = Settings(
+        server=ServerConfig(debug=debug),
         workspace=WorkspaceConfig(root=root),
         viewer=ViewerConfig(max_file_size_mb=max_file_size_mb, ase=AseViewerConfig(max_points_json=max_points_json)),
     )
     return TestClient(create_app(settings))
+
+
+def _write_selective_poscar(path: Path) -> None:
+    path.write_text(
+        "generated\n"
+        "1.0\n"
+        "2 0 0\n"
+        "0 3 0\n"
+        "0 0 4\n"
+        "H O\n"
+        "1 1\n"
+        "Selective Dynamics\n"
+        "Direct\n"
+        "0 0 0 T T T\n"
+        "0.5 0.5 0.5 F F F\n",
+        encoding="utf-8",
+    )
 
 
 def make_compressed_client(root: Path, *, max_points_json: int = 1) -> TestClient:
@@ -130,7 +150,7 @@ def test_ase_preview_and_json_chunk_support_variable_topology_db(tmp_path: Path)
     preview_payload = preview.json()
     assert preview_payload["is_trajectory"] is True
     assert preview_payload["topology_stable"] is False
-    assert preview_payload["transport"] == "json"
+    assert preview_payload["transport"] == "binary-available"
     assert preview_payload["n_frames"] == 3
 
     assert chunk.status_code == 200
@@ -138,6 +158,76 @@ def test_ase_preview_and_json_chunk_support_variable_topology_db(tmp_path: Path)
     assert chunk_payload["start"] == 0
     assert chunk_payload["count"] == 3
     assert [frame["symbols"] for frame in chunk_payload["frames"]] == [["H"], ["H", "H"], ["O"]]
+
+
+def test_ase_variable_topology_db_binary_chunk(tmp_path: Path) -> None:
+    client = make_client(tmp_path)
+    sample = tmp_path / "mixed.db"
+    database = connect(sample)
+    database.write(Atoms("H", positions=[[0, 0, 0]]))
+    database.write(Atoms("H2", positions=[[0, 0, 0], [0, 0, 1]]))
+    database.write(Atoms("O", positions=[[1, 0, 0]]))
+
+    response = client.get("/api/structures/ase/frames.bin", params={"path": str(sample), "start": 0, "count": 3})
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith(STRUCTURE_BINARY_MEDIA_TYPE)
+    body = response.content
+    assert body[:4] == b"CWB1"
+    header_len = struct.unpack("<I", body[4:8])[0]
+    header = json.loads(body[8 : 8 + header_len].decode("utf-8"))
+    padding = (4 - (header_len % 4)) % 4
+    data_start = 8 + header_len + padding
+
+    assert header["frame_encoding"] == "variable-atoms-v1"
+    assert header["n_atoms"] == 0
+    assert header["topology_stable"] is False
+    assert header["arrays"]["frame_atom_counts"]["shape"] == [3]
+    assert header["arrays"]["positions"]["shape"] == [4, 3]
+    assert header["arrays"]["numbers"]["shape"] == [4]
+    assert header["arrays"]["cells"]["shape"] == [3, 3, 3]
+    assert header["arrays"]["pbc"]["shape"] == [3, 3]
+
+    frame_counts_spec = header["arrays"]["frame_atom_counts"]
+    frame_atom_counts = np.frombuffer(
+        body,
+        dtype="<i4",
+        count=frame_counts_spec["byte_length"] // np.dtype("<i4").itemsize,
+        offset=data_start + frame_counts_spec["offset"],
+    )
+    assert frame_atom_counts.tolist() == [1, 2, 1]
+
+    numbers_spec = header["arrays"]["numbers"]
+    numbers = np.frombuffer(
+        body,
+        dtype="<i4",
+        count=numbers_spec["byte_length"] // np.dtype("<i4").itemsize,
+        offset=data_start + numbers_spec["offset"],
+    )
+    # H=1, H2 -> 1,1, O=8; concatenated as [1, 1, 1, 8]
+    assert numbers.tolist() == [1, 1, 1, 8]
+
+    positions_spec = header["arrays"]["positions"]
+    positions = np.frombuffer(
+        body,
+        dtype="<f4",
+        count=positions_spec["byte_length"] // np.dtype("<f4").itemsize,
+        offset=data_start + positions_spec["offset"],
+    ).reshape(positions_spec["shape"])
+    # frame 0 (H) at [0,0,0]; frame 1 (H2) at [0,0,0],[0,0,1]; frame 2 (O) at [1,0,0]
+    assert positions[0:1].tolist() == [[0.0, 0.0, 0.0]]
+    assert positions[1:3].tolist() == [[0.0, 0.0, 0.0], [0.0, 0.0, 1.0]]
+    assert positions[3:4].tolist() == [[1.0, 0.0, 0.0]]
+
+    pbc_spec = header["arrays"]["pbc"]
+    pbc = np.frombuffer(
+        body,
+        dtype=np.uint8,
+        count=pbc_spec["byte_length"],
+        offset=data_start + pbc_spec["offset"],
+    ).reshape(pbc_spec["shape"])
+    # db frames are non-periodic by default
+    assert pbc.tolist() == [[0, 0, 0], [0, 0, 0], [0, 0, 0]]
 
 
 def test_ase_preview_blocks_path_traversal(tmp_path: Path) -> None:
@@ -296,6 +386,110 @@ def test_ase_large_xyz_fast_preview_then_frame_chunk_runs_forward_scan(tmp_path:
     assert payload["count"] == 2
     assert [frame["frame_index"] for frame in payload["frames"]] == [5, 6]
     assert [frame["positions"][0][0] for frame in payload["frames"]] == [5.0, 6.0]
+
+
+def test_ase_large_plain_xyz_fast_binary_chunk_reads_unsampled_frames(tmp_path: Path) -> None:
+    client = make_client(tmp_path)
+    sample = tmp_path / "large_movie.xyz"
+    comment = "c" * 6204
+    frame_count = 1800
+    sample.write_text(
+        "".join(f"1\n{comment}\nH {index:04d} 0 0\n" for index in range(frame_count)),
+        encoding="utf-8",
+    )
+
+    preview = client.get("/api/structures/ase/preview", params={"path": str(sample)})
+    assert preview.status_code == 200
+    assert preview.json()["scan_completed"] is False
+
+    response = client.get("/api/structures/ase/frames.bin", params={"path": str(sample), "start": 16, "count": 16})
+
+    assert response.status_code == 200
+    header_length = struct.unpack_from("<I", response.content, 4)[0]
+    header = json.loads(response.content[8 : 8 + header_length].decode("utf-8"))
+    data_start = 8 + header_length + ((4 - (header_length % 4)) % 4)
+    assert header["start"] == 16
+    assert header["count"] == 16
+    positions_spec = header["arrays"]["positions"]
+    positions = np.frombuffer(
+        response.content,
+        dtype="<f4",
+        count=positions_spec["byte_length"] // np.dtype("<f4").itemsize,
+        offset=data_start + positions_spec["offset"],
+    ).reshape(positions_spec["shape"])
+    assert positions[0, 0, 0] == 16.0
+    assert positions[-1, 0, 0] == 31.0
+
+
+def test_ase_large_plain_xyz_fast_stream_reuses_preview_summary(tmp_path: Path) -> None:
+    client = make_client(tmp_path)
+    sample = tmp_path / "large_movie.xyz"
+    comment = "c" * 6204
+    frame_count = 1800
+    sample.write_text(
+        "".join(f"1\n{comment}\nH {index:04d} 0 0\n" for index in range(frame_count)),
+        encoding="utf-8",
+    )
+
+    preview = client.get("/api/structures/ase/preview", params={"path": str(sample)})
+    assert preview.status_code == 200
+    assert preview.json()["scan_completed"] is False
+
+    stream = client.get("/api/structures/ase/frames.stream", params={"path": str(sample), "chunk": 16})
+
+    assert stream.status_code == 200
+    assert stream.headers["content-type"].startswith("text/event-stream")
+    assert "event: chunk" in stream.text
+    assert "event: meta" not in stream.text
+    assert "stable_stride_direct_arrays" not in stream.text
+    assert "complete_index_direct_arrays" not in stream.text
+
+    debug_client = make_client(tmp_path, debug=True)
+    debug_stream = debug_client.get("/api/structures/ase/frames.stream", params={"path": str(sample), "chunk": 16})
+
+    assert debug_stream.status_code == 200
+    assert "event: meta" in debug_stream.text
+    assert "stable_stride_direct_arrays" in debug_stream.text
+    assert "complete_index_direct_arrays" not in debug_stream.text
+    assert "fast_xyz_direct_arrays:xyz" in debug_stream.text
+
+
+def test_ase_frame_stream_default_chunk_size_is_32(tmp_path: Path) -> None:
+    client = make_client(tmp_path, debug=True)
+    sample = tmp_path / "movie.xyz"
+    sample.write_text(
+        "".join(f"1\nframe {index}\nH {index} 0 0\n" for index in range(40)),
+        encoding="utf-8",
+    )
+
+    response = client.get("/api/structures/ase/frames.stream", params={"path": str(sample)})
+
+    assert response.status_code == 200
+    ready_lines = response.text.splitlines()
+    ready_event_index = ready_lines.index("event: ready")
+    ready_data = json.loads(ready_lines[ready_event_index + 1].removeprefix("data: "))
+    assert ready_data["chunk_size"] == 32
+
+
+def test_ase_large_plain_xyz_fast_range_falls_back_when_stride_changes(tmp_path: Path) -> None:
+    client = make_client(tmp_path)
+    sample = tmp_path / "large_movie.xyz"
+    comment = "c" * 6200
+    frame_count = 1800
+    sample.write_text(
+        "".join(f"1\n{comment} {index}\nH {index} 0 0\n" for index in range(frame_count)),
+        encoding="utf-8",
+    )
+
+    preview = client.get("/api/structures/ase/preview", params={"path": str(sample)})
+    assert preview.status_code == 200
+    assert preview.json()["scan_completed"] is False
+
+    response = client.get("/api/structures/ase/frames.stream", params={"path": str(sample), "chunk": 32})
+
+    assert response.status_code == 200
+    assert "event: chunk" in response.text
+    assert "event: error" not in response.text
 
 
 def test_ase_extxyz_fast_range_preserves_cell_and_offsets(tmp_path: Path) -> None:
@@ -463,6 +657,62 @@ def test_ase_plain_xyz_fast_parser_reads_comment_energy(tmp_path: Path) -> None:
     assert payload["frame"]["energy"] == -2.5
 
 
+def test_ase_plain_xyz_fixed_topology_fast_range_keeps_metadata(tmp_path: Path) -> None:
+    client = make_client(tmp_path)
+    sample = tmp_path / "movie.xyz"
+    sample.write_text(
+        "".join(
+            (
+                "2\n"
+                f"frame {index} energy={-1.0 - index} fmax={2.0 + index}\n"
+                f"H {index}.0 0.0 0.0\n"
+                f"O {index}.5 1.0 0.0\n"
+            )
+            for index in range(4)
+        ),
+        encoding="utf-8",
+    )
+
+    response = client.get("/api/structures/ase/frames", params={"path": str(sample), "start": 1, "count": 2})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["count"] == 2
+    assert [frame["symbols"] for frame in payload["frames"]] == [["H", "O"], ["H", "O"]]
+    assert [frame["numbers"] for frame in payload["frames"]] == [[1, 8], [1, 8]]
+    assert payload["frames"][0]["positions"] == [[1.0, 0.0, 0.0], [1.5, 1.0, 0.0]]
+    assert payload["frames"][1]["positions"] == [[2.0, 0.0, 0.0], [2.5, 1.0, 0.0]]
+    assert payload["frames"][0]["energy"] == -2.0
+    assert payload["frames"][1]["fmax"] == 4.0
+
+
+def test_ase_plain_xyz_variable_topology_range_uses_fallback(tmp_path: Path, monkeypatch) -> None:
+    client = make_client(tmp_path)
+    sample = tmp_path / "movie.xyz"
+    sample.write_text(
+        "1\nframe 0\nH 0 0 0\n"
+        "2\nframe 1\nH 1 0 0\nO 1 1 0\n",
+        encoding="utf-8",
+    )
+
+    fixed_range_calls = 0
+    original_fixed_range = StructureService._read_plain_xyz_fixed_frame_range
+
+    def counted_fixed_range(self, path, index, start, end):
+        nonlocal fixed_range_calls
+        fixed_range_calls += 1
+        return original_fixed_range(self, path, index, start, end)
+
+    monkeypatch.setattr(StructureService, "_read_plain_xyz_fixed_frame_range", counted_fixed_range)
+
+    response = client.get("/api/structures/ase/frames", params={"path": str(sample), "start": 0, "count": 2})
+
+    assert response.status_code == 200
+    assert fixed_range_calls == 0
+    payload = response.json()
+    assert [frame["symbols"] for frame in payload["frames"]] == [["H"], ["H", "O"]]
+
+
 def test_ase_traj_preview_uses_native_index_and_last_frame(tmp_path: Path, monkeypatch) -> None:
     client = make_client(tmp_path)
     sample = tmp_path / "movie.traj"
@@ -607,8 +857,13 @@ def test_ase_xdatcar_preview_and_frame_use_fast_parser(tmp_path: Path, monkeypat
         "0.5 0.25 0.75\n",
         encoding="utf-8",
     )
+    _write_selective_poscar(tmp_path / "POSCAR")
+
+    original_read = structure_service_module.read
 
     def fail_ase_read(*args, **kwargs):
+        if kwargs.get("format") == "vasp":
+            return original_read(*args, **kwargs)
         raise AssertionError("standard XDATCAR should use the direct fast parser")
 
     monkeypatch.setattr(structure_service_module, "iread", fail_ase_read)
@@ -624,9 +879,11 @@ def test_ase_xdatcar_preview_and_frame_use_fast_parser(tmp_path: Path, monkeypat
     assert payload["initial_frame_index"] == 1
     assert payload["frame"]["symbols"] == ["H", "O"]
     assert payload["frame"]["positions"] == [[0.5, 0.0, 0.0], [1.0, 0.75, 3.0]]
+    assert payload["frame"]["fixed_indices"] == [1]
 
     assert frame.status_code == 200
     assert frame.json()["positions"] == [[0.0, 0.0, 0.0], [1.0, 1.5, 2.0]]
+    assert frame.json()["fixed_indices"] == [1]
 
 
 def test_ase_xdatcar_binary_chunk_uses_fast_parser(tmp_path: Path, monkeypatch) -> None:
@@ -648,8 +905,13 @@ def test_ase_xdatcar_binary_chunk_uses_fast_parser(tmp_path: Path, monkeypatch) 
         "0.5 0.25 0.75\n",
         encoding="utf-8",
     )
+    _write_selective_poscar(tmp_path / "POSCAR")
+
+    original_read = structure_service_module.read
 
     def fail_ase_read(*args, **kwargs):
+        if kwargs.get("format") == "vasp":
+            return original_read(*args, **kwargs)
         raise AssertionError("standard XDATCAR should use the direct fast parser")
 
     monkeypatch.setattr(structure_service_module, "iread", fail_ase_read)
@@ -669,6 +931,7 @@ def test_ase_xdatcar_binary_chunk_uses_fast_parser(tmp_path: Path, monkeypatch) 
     assert header["format"] == "vasp-xdatcar"
     assert header["symbols"] == ["H", "O"]
     assert header["arrays"]["positions"]["shape"] == [2, 2, 3]
+    assert header["arrays"]["fixed_mask"]["shape"] == [2, 2]
 
     positions_spec = header["arrays"]["positions"]
     positions = np.frombuffer(
@@ -681,6 +944,221 @@ def test_ase_xdatcar_binary_chunk_uses_fast_parser(tmp_path: Path, monkeypatch) 
         [[0.0, 0.0, 0.0], [1.0, 1.5, 2.0]],
         [[0.5, 0.0, 0.0], [1.0, 0.75, 3.0]],
     ]
+
+    fixed_spec = header["arrays"]["fixed_mask"]
+    fixed_mask = np.frombuffer(
+        body,
+        dtype=np.uint8,
+        count=fixed_spec["byte_length"],
+        offset=data_start + fixed_spec["offset"],
+    ).reshape(fixed_spec["shape"])
+    assert fixed_mask.tolist() == [[0, 1], [0, 1]]
+
+    debug_client = make_client(tmp_path, debug=True)
+    debug_stream = debug_client.get("/api/structures/ase/frames.stream", params={"path": str(sample), "chunk": 2})
+    assert debug_stream.status_code == 200
+    assert '"read_path": "fast_xdatcar_direct_arrays"' in debug_stream.text
+
+
+def test_ase_xdatcar_header_per_frame_variant_uses_fast_variable_parser(tmp_path: Path, monkeypatch) -> None:
+    client = make_client(tmp_path)
+    sample = tmp_path / "XDATCAR2"
+    sample.write_text(
+        "Ag Cu O\n"
+        "1.0\n"
+        "2 0 0\n"
+        "0 3 0\n"
+        "0 0 4\n"
+        "Ag Cu O\n"
+        "1 1 1\n"
+        "Direct configuration=     1\n"
+        "0 0 0\n"
+        "0.5 0.5 0.5\n"
+        "0.25 0.25 0.25\n"
+        "Ag C\n"
+        "1.0\n"
+        "4 0 0\n"
+        "0 5 0\n"
+        "0 0 6\n"
+        "Ag C\n"
+        "1 2\n"
+        "Direct configuration=     2\n"
+        "0.25 0 0\n"
+        "0.5 0.25 0.75\n"
+        "0.1 0.2 0.3\n",
+        encoding="utf-8",
+    )
+
+    def fail_ase_read(*args, **kwargs):
+        raise AssertionError("header-per-frame XDATCAR variant should use the fast parser")
+
+    monkeypatch.setattr(structure_service_module, "iread", fail_ase_read)
+    monkeypatch.setattr(structure_service_module, "read", fail_ase_read)
+
+    preview = client.get("/api/structures/ase/preview", params={"path": str(sample)})
+    frame0 = client.get("/api/structures/ase/frame", params={"path": str(sample), "index": 0})
+    chunk = client.get("/api/structures/ase/frames.bin", params={"path": str(sample), "start": 0, "count": 2})
+
+    assert preview.status_code == 200
+    payload = preview.json()
+    assert payload["format"] == "vasp-xdatcar"
+    assert payload["n_frames"] == 2
+    assert payload["topology_stable"] is False
+    assert payload["frame"]["symbols"] == ["Ag", "C", "C"]
+    assert payload["frame"]["positions"] == [[1.0, 0.0, 0.0], [2.0, 1.25, 4.5], [0.4, 1.0, 1.8]]
+
+    assert frame0.status_code == 200
+    assert frame0.json()["symbols"] == ["Ag", "Cu", "O"]
+    assert frame0.json()["positions"] == [[0.0, 0.0, 0.0], [1.0, 1.5, 2.0], [0.5, 0.75, 1.0]]
+
+    assert chunk.status_code == 200
+    header_len = struct.unpack("<I", chunk.content[4:8])[0]
+    header = json.loads(chunk.content[8 : 8 + header_len].decode("utf-8"))
+    assert header["frame_encoding"] == "variable-atoms-v1"
+    assert header["arrays"]["frame_atom_counts"]["shape"] == [2]
+
+    debug_client = make_client(tmp_path, debug=True)
+    debug_stream = debug_client.get("/api/structures/ase/frames.stream", params={"path": str(sample), "chunk": 2})
+    assert debug_stream.status_code == 200
+    assert '"read_path": "fast_xdatcar_variable"' in debug_stream.text
+
+
+def test_ase_xdatcar_header_per_frame_variant_reuses_marker_offsets(tmp_path: Path, monkeypatch) -> None:
+    client = make_client(tmp_path)
+    sample = tmp_path / "XDATCAR2"
+    sample.write_text(
+        "Ag Cu O\n"
+        "1.0\n"
+        "2 0 0\n"
+        "0 3 0\n"
+        "0 0 4\n"
+        "Ag Cu O\n"
+        "1 1 1\n"
+        "Direct configuration=     1\n"
+        "0 0 0\n"
+        "0.5 0.5 0.5\n"
+        "0.25 0.25 0.25\n"
+        "Ag C\n"
+        "1.0\n"
+        "4 0 0\n"
+        "0 5 0\n"
+        "0 0 6\n"
+        "Ag C\n"
+        "1 2\n"
+        "Direct configuration=     2\n"
+        "0.25 0 0\n"
+        "0.5 0.25 0.75\n"
+        "0.1 0.2 0.3\n",
+        encoding="utf-8",
+    )
+
+    def fail_text_scan(*args, **kwargs):
+        raise AssertionError("header-per-frame XDATCAR should reuse marker offsets")
+
+    monkeypatch.setattr(StructureService, "_xdatcar_variable_header_offsets_by_text_scan", fail_text_scan)
+
+    preview = client.get("/api/structures/ase/preview", params={"path": str(sample)})
+
+    assert preview.status_code == 200
+    payload = preview.json()
+    assert payload["topology_stable"] is False
+    assert payload["frame"]["symbols"] == ["Ag", "C", "C"]
+
+
+def test_ase_xdatcar_header_per_frame_preview_uses_tail_fast_path(tmp_path: Path, monkeypatch) -> None:
+    client = make_client(tmp_path)
+    sample = tmp_path / "XDATCAR2"
+    sample.write_text(
+        "Ag Cu O\n"
+        "1.0\n"
+        "2 0 0\n"
+        "0 3 0\n"
+        "0 0 4\n"
+        "Ag Cu O\n"
+        "1 1 1\n"
+        "Direct configuration=     1\n"
+        "0 0 0\n"
+        "0.5 0.5 0.5\n"
+        "0.25 0.25 0.25\n"
+        "Ag C\n"
+        "1.0\n"
+        "4 0 0\n"
+        "0 5 0\n"
+        "0 0 6\n"
+        "Ag C\n"
+        "1 2\n"
+        "Direct configuration=     2\n"
+        "0.25 0 0\n"
+        "0.5 0.25 0.75\n"
+        "0.1 0.2 0.3\n",
+        encoding="utf-8",
+    )
+
+    def fail_full_marker_scan(*args, **kwargs):
+        raise AssertionError("preview should not build a full XDATCAR marker offset table")
+
+    def fail_marker_count(*args, **kwargs):
+        raise AssertionError("preview should read n_frames from the last XDATCAR marker")
+
+    monkeypatch.setattr(StructureService, "_xdatcar_preview_fast_threshold_bytes", lambda _self: 0)
+    monkeypatch.setattr(StructureService, "_find_binary_marker_line_offsets", fail_full_marker_scan)
+    monkeypatch.setattr(StructureService, "_count_binary_marker_occurrences", fail_marker_count)
+
+    preview = client.get("/api/structures/ase/preview", params={"path": str(sample)})
+
+    assert preview.status_code == 200
+    payload = preview.json()
+    assert payload["n_frames"] == 2
+    assert payload["scan_completed"] is False
+    assert payload["topology_stable"] is False
+    assert payload["frame"]["symbols"] == ["Ag", "C", "C"]
+    assert payload["frame"]["positions"] == [[1.0, 0.0, 0.0], [2.0, 1.25, 4.5], [0.4, 1.0, 1.8]]
+
+
+def test_ase_xdatcar_header_per_frame_stream_rescans_after_fast_preview(tmp_path: Path, monkeypatch) -> None:
+    client = make_client(tmp_path, debug=True)
+    sample = tmp_path / "XDATCAR2"
+    sample.write_text(
+        "Ag Cu O\n"
+        "1.0\n"
+        "2 0 0\n"
+        "0 3 0\n"
+        "0 0 4\n"
+        "Ag Cu O\n"
+        "1 1 1\n"
+        "Direct configuration=     1\n"
+        "0 0 0\n"
+        "0.5 0.5 0.5\n"
+        "0.25 0.25 0.25\n"
+        "Ag C\n"
+        "1.0\n"
+        "4 0 0\n"
+        "0 5 0\n"
+        "0 0 6\n"
+        "Ag C\n"
+        "1 2\n"
+        "Direct configuration=     2\n"
+        "0.25 0 0\n"
+        "0.5 0.25 0.75\n"
+        "0.1 0.2 0.3\n",
+        encoding="utf-8",
+    )
+
+    def fail_ase_read(*args, **kwargs):
+        raise AssertionError("header-per-frame XDATCAR stream should use the fast parser")
+
+    monkeypatch.setattr(structure_service_module, "iread", fail_ase_read)
+    monkeypatch.setattr(structure_service_module, "read", fail_ase_read)
+
+    preview = client.get("/api/structures/ase/preview", params={"path": str(sample)})
+    assert preview.status_code == 200
+    assert preview.json()["scan_completed"] is False
+
+    stream = client.get("/api/structures/ase/frames.stream", params={"path": str(sample), "chunk": 2})
+
+    assert stream.status_code == 200
+    assert "event: error" not in stream.text
+    assert '"read_path": "fast_xdatcar_variable"' in stream.text
 
 
 def test_ase_outcar_md_preview_returns_warning_and_metrics(tmp_path: Path) -> None:
@@ -901,8 +1379,8 @@ def test_ase_xsd_preview_and_frame_use_fast_parser(tmp_path: Path, monkeypatch) 
     sample.write_text(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
         "<XSD><AtomisticTreeRoot><SymmetrySystem><MappingSet><MappingFamily><IdentityMapping>\n"
-        "<Atom3d Components=\"H\" XYZ=\"0,0,0\" />\n"
-        "<Atom3d Components=\"O\" XYZ=\"0.5,0.25,0.75\" />\n"
+        "<Atom3d ID=\"4\" Components=\"H\" XYZ=\"0,0,0\" />\n"
+        "<Atom3d ID=\"5\" Components=\"O\" XYZ=\"0.5,0.25,0.75\" RestrictedProperties=\"FractionalXYZ\" />\n"
         "<SpaceGroup AVector=\"2,0,0\" BVector=\"0,3,0\" CVector=\"0,0,4\" />\n"
         "</IdentityMapping></MappingFamily></MappingSet></SymmetrySystem></AtomisticTreeRoot></XSD>\n",
         encoding="utf-8",
@@ -923,9 +1401,37 @@ def test_ase_xsd_preview_and_frame_use_fast_parser(tmp_path: Path, monkeypatch) 
     assert payload["frame"]["symbols"] == ["H", "O"]
     assert payload["frame"]["cell"] == [[2.0, 0.0, 0.0], [0.0, 3.0, 0.0], [0.0, 0.0, 4.0]]
     assert payload["frame"]["positions"] == [[0.0, 0.0, 0.0], [1.0, 0.75, 3.0]]
+    assert payload["frame"]["fixed_indices"] == [1]
 
     assert frame.status_code == 200
     assert frame.json()["positions"] == [[0.0, 0.0, 0.0], [1.0, 0.75, 3.0]]
+    assert frame.json()["fixed_indices"] == [1]
+
+
+def test_ase_xsd_fast_parser_reads_complete_restriction_fixed_indices(tmp_path: Path, monkeypatch) -> None:
+    client = make_client(tmp_path)
+    sample = tmp_path / "fixed-complete-restriction.xsd"
+    sample.write_text(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+        "<XSD><AtomisticTreeRoot><SymmetrySystem><MappingSet><MappingFamily><IdentityMapping>\n"
+        "<Atom3d ID=\"4\" Components=\"H\" XYZ=\"0,0,0\" />\n"
+        "<Atom3d ID=\"5\" Components=\"O\" XYZ=\"0.5,0.25,0.75\" />\n"
+        "<CompleteRestriction ID=\"7\" RestrictsObjects=\"ci(1):5\" RestrictsProperties=\"FractionalXYZ\" />\n"
+        "<SpaceGroup AVector=\"2,0,0\" BVector=\"0,3,0\" CVector=\"0,0,4\" />\n"
+        "</IdentityMapping></MappingFamily></MappingSet></SymmetrySystem></AtomisticTreeRoot></XSD>\n",
+        encoding="utf-8",
+    )
+
+    def fail_ase_read(*args, **kwargs):
+        raise AssertionError("periodic xsd should use the direct fast parser")
+
+    monkeypatch.setattr(structure_service_module, "iread", fail_ase_read)
+    monkeypatch.setattr(structure_service_module, "read", fail_ase_read)
+
+    preview = client.get("/api/structures/ase/preview", params={"path": str(sample)})
+
+    assert preview.status_code == 200
+    assert preview.json()["frame"]["fixed_indices"] == [1]
 
 
 def test_ase_dmol_arc_preview_frame_and_binary_use_fast_parser(tmp_path: Path, monkeypatch) -> None:

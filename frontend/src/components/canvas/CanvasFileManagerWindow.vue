@@ -48,6 +48,7 @@
         :selected-items="selectedItems"
         :loading="loading"
         :system-icon-provider="launcherSystemIconProvider"
+        :preview-providers="previewProviders"
         @selection-change="handleSelectionChange"
         @context-menu="handleContextMenu"
         @move-items="handleMoveItems"
@@ -203,6 +204,7 @@ import {
   launcherFileIconUrl,
   openWithLocalApp,
   openWithNotepad,
+  parentDirectoryPath,
   type LauncherBridgeCapabilities
 } from '../../api/launcherBridge'
 import {
@@ -218,6 +220,7 @@ import {
   type DirectoryListing,
   type FileItem
 } from '../../api/files'
+import type { FilePreviewProvider } from '../../api/filePreviewProviders'
 import {
   collectDropUploadEntries,
   filesToUploadEntries,
@@ -230,6 +233,8 @@ import {
   type UploadConflictResolution,
   type UploadEntry
 } from '../../api/uploadEntries'
+import { confirmOversizedUpload } from '../../api/uploadSizeCheck'
+import { useSystemStore } from '../../stores/system'
 import { submitJob, type SubmitCommand } from '../../api/jobs'
 import { t } from '../../i18n'
 import FileToolbar from '../FileToolbar.vue'
@@ -240,6 +245,7 @@ const props = defineProps<{
   refreshToken?: number
   launcherBridgeCapabilities?: LauncherBridgeCapabilities | null
   workspaceRoot?: string | null
+  previewProviders?: FilePreviewProvider[]
 }>()
 
 const emit = defineEmits<{
@@ -248,6 +254,8 @@ const emit = defineEmits<{
   'selection-change': [items: FileItem[], primary: FileItem | null]
   'directories-change': [paths: string[]]
 }>()
+
+const systemStore = useSystemStore()
 
 const listing = shallowRef<DirectoryListing | null>(null)
 const currentPath = ref(props.initialPath ?? '')
@@ -354,7 +362,10 @@ watch(
   () => props.refreshToken,
   (token, previous) => {
     if (token === previous) return
-    void loadDirectory(currentPath.value || props.initialPath || undefined, { recordHistory: false, refresh: true })
+    const targetPath = props.initialPath && props.initialPath !== currentPath.value
+      ? props.initialPath
+      : currentPath.value || props.initialPath || undefined
+    void loadDirectory(targetPath, { recordHistory: false, refresh: true })
   }
 )
 
@@ -595,6 +606,8 @@ async function handleUploadEntries(entries: UploadEntry[], targetPath = currentP
   if (prepared.length === 0) {
     return
   }
+  const proceed = await confirmOversizedUpload(systemStore.systemInfo, prepared)
+  if (!proceed) return
 
   let uploaded = 0
   let firstError: unknown = null
@@ -955,13 +968,7 @@ function copyChangedDirectories(targetPath: string) {
   return Array.from(new Set([currentPath.value, targetPath])).filter(Boolean)
 }
 
-function parentDirectoryPath(path: string) {
-  const normalized = normalizePath(path)
-  const index = normalized.lastIndexOf('/')
-  if (index < 0) return ''
-  if (index === 0) return normalized.slice(0, 1)
-  return normalized.slice(0, index)
-}
+
 
 function normalizePath(path: string) {
   return path.replace(/\\/g, '/').replace(/\/+$/, '')

@@ -196,7 +196,7 @@ plugins/
 
 - 扫描阶段不得执行插件代码。
 - 激活阶段应幂等。同一插件多次打开时，不应重复挂载同一路由或重复启动同一后台服务。
-- 停用阶段应尽量释放定时器、子进程、文件句柄和网络连接。
+- 停用阶段应尽量释放定时器、子进程、文件句柄和网络连接。宿主会卸载插件挂载在 `/api/plugins/{plugin_id}/api/*` 下的后端路由；再次激活同一插件时，宿主可复用已加载实例，但必须重新挂载这些路由。
 - 插件异常不能导致主程序退出。宿主应捕获异常并在 UI 中显示插件错误状态。
 
 ## 后端插件接口
@@ -453,8 +453,8 @@ preview 前端应基于 `StructureSource.apiBase` 调用同构接口，而不是
 | --- | --- | --- |
 | `GET {apiBase}/preview?path=...&force=false` | `AsePreviewResponse` 兼容结构 | 返回摘要和初始帧。 |
 | `GET {apiBase}/frame?path=...&index=0&force=false` | `AseFrame` 兼容结构 | 返回单帧。 |
-| `GET {apiBase}/frames?path=...&start=0&count=64&force=false` | `AseFrameChunkResponse` 兼容结构 | JSON 分帧块。 |
-| `GET {apiBase}/frames.bin?path=...&start=0&count=64&force=false` | `application/vnd.chemssh.structure+bin` | 二进制分帧块。 |
+| `GET {apiBase}/frames?path=...&start=0&count=32&force=false` | `AseFrameChunkResponse` 兼容结构 | JSON 分帧块。 |
+| `GET {apiBase}/frames.bin?path=...&start=0&count=32&force=false` | `application/vnd.chemssh.structure+bin` | 二进制分帧块。 |
 
 实现时可以把现有 `readAsePreview`、`readAseFrame`、`readAseFrameJsonChunk`、`readAseFrameChunk` 泛化为 `readStructurePreview(source, ...)` 这一类 wrapper；ASE 只是默认 `StructureSource`，cclib 插件是另一个后端数据源。
 
@@ -679,8 +679,8 @@ numpy>=1.26
 POST /api/plugins/cclib/api/probe
 GET /api/plugins/cclib/api/structures/preview?path=/workspace/case/opt.log&force=false
 GET /api/plugins/cclib/api/structures/frame?path=/workspace/case/opt.log&index=0&force=false
-GET /api/plugins/cclib/api/structures/frames?path=/workspace/case/opt.log&start=0&count=64&force=false
-GET /api/plugins/cclib/api/structures/frames.bin?path=/workspace/case/opt.log&start=0&count=64&force=false
+GET /api/plugins/cclib/api/structures/frames?path=/workspace/case/opt.log&start=0&count=32&force=false
+GET /api/plugins/cclib/api/structures/frames.bin?path=/workspace/case/opt.log&start=0&count=32&force=false
 ```
 
 `probe` 响应用于文件管理器双击前的快速判断：

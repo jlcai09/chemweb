@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import json
 import locale
 import os
 import queue
@@ -10,6 +12,8 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -36,7 +40,7 @@ class LocalPtyTerminalProvider(TerminalProvider):
 
     def start(self, cwd: str, rows: int, cols: int, shell: str | None = None) -> None:
         self._shell = shell or self._default_shell()
-        if os.name == "nt":
+        if _is_windows():
             try:
                 self._start_winpty(cwd, rows, cols)
             except ImportError:
@@ -45,12 +49,27 @@ class LocalPtyTerminalProvider(TerminalProvider):
 
         from ptyprocess import PtyProcessUnicode
 
+        spawn_args = [self._shell, "-l"]
+        if _shell_is_bash(self._shell):
+            # Bash only honors --rcfile for interactive non-login shells. The
+            # generated rcfile emulates login profile loading, then appends our
+            # cwd marker after profiles have had a chance to reset PROMPT_COMMAND.
+            init_path = self._chemssh_cwd_init_path()
+            spawn_args = [self._shell, "--rcfile", str(init_path), "-i"]
+
         self._pty = PtyProcessUnicode.spawn(
-            [self._shell, '-l'],
+            spawn_args,
             cwd=cwd,
             dimensions=(rows, cols),
             env=self._terminal_env(),
         )
+
+    def _chemssh_cwd_init_path(self) -> Path:
+        shim_dir = self._ensure_transfer_shims()
+        init_path = shim_dir / "chemssh-cwd-init.sh"
+        if not init_path.exists():
+            init_path.write_text(_CHEMSSH_CWD_INIT_SH, encoding="utf-8", newline="\n")
+        return init_path
 
     def write(self, data: str) -> None:
         if self._pty is not None:
@@ -100,19 +119,29 @@ class LocalPtyTerminalProvider(TerminalProvider):
                 self._pty.terminate(force=True)
             except Exception:
                 pass
+            self._pty = None
 
         if self._winpty is not None:
             try:
                 self._winpty.terminate(force=True)
             except Exception:
                 pass
+            self._winpty = None
 
-        if self._process is not None and self._process.poll() is None:
-            self._process.terminate()
-            try:
-                self._process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                self._process.kill()
+        if self._process is not None:
+            if self._process.poll() is None:
+                self._process.terminate()
+                try:
+                    self._process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    self._process.kill()
+            for pipe in (self._process.stdin, self._process.stdout, self._process.stderr):
+                if pipe is not None and not pipe.closed:
+                    try:
+                        pipe.close()
+                    except OSError:
+                        pass
+            self._process = None
 
         if self._transfer_shim_dir is not None:
             shutil.rmtree(self._transfer_shim_dir, ignore_errors=True)
@@ -142,7 +171,7 @@ class LocalPtyTerminalProvider(TerminalProvider):
         return None
 
     def build_cd_command(self, path: str) -> str:
-        if os.name != "nt":
+        if not _is_windows():
             return super().build_cd_command(path)
 
         shell_name = Path(self._shell).name.lower()
@@ -166,7 +195,7 @@ class LocalPtyTerminalProvider(TerminalProvider):
         return None
 
     def _default_shell(self) -> str:
-        if os.name == "nt":
+        if _is_windows():
             return (
                 shutil.which("pwsh")
                 or shutil.which("powershell")
@@ -176,7 +205,7 @@ class LocalPtyTerminalProvider(TerminalProvider):
         return os.environ.get("SHELL") or ("/bin/bash" if Path("/bin/bash").exists() else "/bin/sh")
 
     def _terminal_env(self) -> dict[str, str]:
-        env = os.environ.copy()
+        env = _clean_inherited_terminal_env(os.environ.copy())
         shim_dir = self._ensure_transfer_shims()
         path_parts = [str(shim_dir)]
         existing_path = env.get("PATH")
@@ -184,12 +213,15 @@ class LocalPtyTerminalProvider(TerminalProvider):
             path_parts.append(existing_path)
         env["PATH"] = os.pathsep.join(path_parts)
         env["CHEMSSH_TRANSFER_SHIM"] = "1"
+        transfer_executable = _transfer_bundle_executable()
+        if transfer_executable is not None:
+            env["CHEMSSH_TRANSFER_EXECUTABLE"] = transfer_executable
         env.setdefault("TERM", "xterm-256color")
         env.setdefault("COLORTERM", "truecolor")
         env.setdefault("PYTHONIOENCODING", "utf-8")
         env.setdefault("PYTHONUTF8", "1")
         shell_name = Path(self._shell).name.lower()
-        if os.name == "nt" and "powershell" not in shell_name and not shell_name.startswith("pwsh"):
+        if _is_windows() and "powershell" not in shell_name and not shell_name.startswith("pwsh"):
             env["PROMPT"] = f"$E]633;P;Cwd=$P$E\\{env.get('PROMPT', '$P$G')}"
         elif "bash" in shell_name:
             cwd_marker = r'printf "\033]633;P;Cwd=%s\007" "$PWD"'
@@ -365,6 +397,49 @@ class LocalPtyTerminalProvider(TerminalProvider):
         return "".join(chunks)
 
 
+_CHEMSSH_CWD_INIT_SH = r'''# chemssh-cwd-init.sh: keep bidirectional cwd sync alive after login profiles run.
+
+# Bash only reads --rcfile for interactive non-login shells. ChemSSH uses this
+# file as the interactive startup file, mirrors bash's login profile sequence,
+# then installs its prompt hook after those profiles can reset PROMPT_COMMAND.
+if [[ -z "${CHEMSSH_BASH_LOGIN_INIT_DONE:-}" ]]; then
+    CHEMSSH_BASH_LOGIN_INIT_DONE=1
+    if [[ -r /etc/profile ]]; then
+        # shellcheck disable=SC1091
+        source /etc/profile
+    fi
+
+    if [[ -n "${HOME:-}" ]]; then
+        for _chemssh_profile in "${HOME}/.bash_profile" "${HOME}/.bash_login" "${HOME}/.profile"; do
+            if [[ -r "${_chemssh_profile}" ]]; then
+                # shellcheck disable=SC1090
+                source "${_chemssh_profile}"
+                break
+            fi
+        done
+        unset _chemssh_profile
+    fi
+fi
+
+# Install the bidirectional cwd marker. Idempotent: if the marker is already
+# chained into PROMPT_COMMAND (e.g. by the env injection in _terminal_env()),
+# leave the existing wiring untouched so user prompt hooks still run.
+_chemssh_marker='printf "\033]633;P;Cwd=%s\007" "$PWD"'
+case "${PROMPT_COMMAND:-}" in
+    *"]633;P;Cwd="*)
+        ;;  # already chained; do not double-insert
+    *)
+        if [[ -n "${PROMPT_COMMAND:-}" ]]; then
+            PROMPT_COMMAND="${_chemssh_marker}; ${PROMPT_COMMAND}"
+        else
+            PROMPT_COMMAND="${_chemssh_marker}"
+        fi
+        ;;
+esac
+unset _chemssh_marker
+'''
+
+
 _TRANSFER_SHIM_PYTHON = r'''from __future__ import annotations
 
 import base64
@@ -422,13 +497,135 @@ if __name__ == "__main__":
 
 
 def _posix_transfer_wrapper(direction: str, helper: Path) -> str:
-    python = str(Path(sys.executable))
-    return f"#!/bin/sh\nexec {_shell_quote(python)} {_shell_quote(str(helper))} {_shell_quote(direction)} \"$@\"\n"
+    python = _shell_quote(str(Path(sys.executable)))
+    helper_arg = _shell_quote(str(helper))
+    shim_dir_arg = _shell_quote(str(helper.parent))
+    direction_arg = _shell_quote(direction)
+    return f"""#!/bin/sh
+if [ -n "${{CHEMSSH_TRANSFER_EXECUTABLE:-}}" ] && [ -x "$CHEMSSH_TRANSFER_EXECUTABLE" ]; then
+    exec "$CHEMSSH_TRANSFER_EXECUTABLE" --terminal-transfer-shim {direction_arg} {shim_dir_arg} "$@"
+fi
+exec {python} {helper_arg} {direction_arg} "$@"
+"""
 
 
 def _windows_transfer_wrapper(direction: str, helper: Path) -> str:
     python = str(Path(sys.executable))
-    return f'@"{python}" "{helper}" {direction} %*\r\n'
+    return (
+        "@echo off\r\n"
+        "if defined CHEMSSH_TRANSFER_EXECUTABLE (\r\n"
+        f'  "%CHEMSSH_TRANSFER_EXECUTABLE%" --terminal-transfer-shim {direction} "{helper.parent}" %*\r\n'
+        "  exit /b %ERRORLEVEL%\r\n"
+        ")\r\n"
+        f'"{python}" "{helper}" {direction} %*\r\n'
+    )
+
+
+def run_transfer_shim(direction: str, shim_dir: str, args: Sequence[str]) -> int:
+    command = "rz" if direction == "upload" else "sz"
+    ack_dir = Path(shim_dir).resolve() / "acks"
+    ack_dir.mkdir(parents=True, exist_ok=True)
+    ack_path = ack_dir / f"{os.getpid()}-{time.monotonic_ns()}.json"
+    argv = [command, *args]
+    payload = {
+        "direction": direction,
+        "argv": argv,
+        "cwd": os.getcwd(),
+        "ack_path": str(ack_path),
+    }
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    encoded = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+    sys.stdout.write(f"\033]777;chemssh-transfer;{encoded}\007")
+    sys.stdout.flush()
+    deadline = time.monotonic() + 86400
+    while time.monotonic() < deadline:
+        if ack_path.exists():
+            try:
+                ack = json.loads(ack_path.read_text(encoding="utf-8"))
+            except Exception:
+                ack = {}
+            try:
+                ack_path.unlink()
+            except OSError:
+                pass
+            if ack.get("success"):
+                return 0
+            message = ack.get("message")
+            if isinstance(message, str) and message:
+                sys.stderr.write(message + "\n")
+                sys.stderr.flush()
+            return 1
+        time.sleep(0.1)
+    sys.stderr.write("ChemSSH transfer timed out\n")
+    sys.stderr.flush()
+    return 1
+
+
+def _transfer_bundle_executable() -> str | None:
+    executable = Path(sys.executable)
+    if executable.name.lower().startswith("python") or not executable.exists():
+        return None
+    return str(executable)
+
+
+def _clean_inherited_terminal_env(source: dict[str, str]) -> dict[str, str]:
+    """Drop ChemSSH service virtual-env state before starting an interactive shell.
+
+    The user's shell startup files still run afterwards, so environments activated
+    from login profiles, files they source such as ~/.bashrc, conda init, etc.
+    behave like a normal SSH login. This only prevents the web terminal from
+    inheriting the environment that happened to be active when ChemSSH itself
+    was launched.
+    """
+    env = dict(source)
+    env_prefixes = _active_python_env_prefixes(env)
+    for key in list(env):
+        upper_key = key.upper()
+        if upper_key in {"VIRTUAL_ENV", "VIRTUAL_ENV_PROMPT", "__PYVENV_LAUNCHER__", "PYTHONHOME"}:
+            env.pop(key, None)
+        elif upper_key.startswith("CONDA_") or upper_key in {"_CE_CONDA", "_CE_M", "_CONDA_ROOT", "_CONDA_EXE"}:
+            env.pop(key, None)
+
+    path_value = env.get("PATH")
+    if path_value and env_prefixes:
+        env["PATH"] = os.pathsep.join(
+            part for part in path_value.split(os.pathsep) if not _path_belongs_to_any_prefix(part, env_prefixes)
+        )
+    return env
+
+
+def _active_python_env_prefixes(env: dict[str, str]) -> list[Path]:
+    prefixes: list[Path] = []
+    virtual_env = env.get("VIRTUAL_ENV")
+    if virtual_env:
+        prefixes.append(Path(virtual_env))
+    for key, value in env.items():
+        upper_key = key.upper()
+        if (upper_key == "CONDA_PREFIX" or upper_key.startswith("CONDA_PREFIX_")) and value:
+            prefixes.append(Path(value))
+    return prefixes
+
+
+def _path_belongs_to_any_prefix(path_entry: str, prefixes: Sequence[Path]) -> bool:
+    if not path_entry:
+        return False
+    try:
+        path = Path(path_entry).expanduser().resolve(strict=False)
+    except OSError:
+        return False
+    return any(_same_or_child_path(path, prefix) for prefix in prefixes)
+
+
+def _same_or_child_path(path: Path, prefix: Path) -> bool:
+    try:
+        resolved_prefix = prefix.expanduser().resolve(strict=False)
+    except OSError:
+        return False
+    if _is_windows():
+        path_text = os.path.normcase(str(path))
+        prefix_text = os.path.normcase(str(resolved_prefix))
+        return path_text == prefix_text or path_text.startswith(prefix_text.rstrip("\\/") + os.sep)
+    return path == resolved_prefix or resolved_prefix in path.parents
 
 
 def _posix_vim_wrapper(command: str) -> str:
@@ -465,3 +662,18 @@ exec "$real_command" "$@"
 
 def _shell_quote(value: str) -> str:
     return "'" + value.replace("'", "'\"'\"'") + "'"
+
+
+def _shell_is_bash(shell: str) -> bool:
+    """Return True for bash-compatible executables that accept --rcfile.
+
+    Other POSIX shells (zsh, fish, ksh, dash) and Windows shells rely on their
+    existing startup behavior.
+    """
+    if _is_windows():
+        return False
+    return "bash" in Path(shell).name.lower()
+
+
+def _is_windows() -> bool:
+    return os.name == "nt"

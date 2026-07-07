@@ -118,7 +118,6 @@ async function confirmClearCache() {
   try {
     await ElMessageBox.confirm(t('settings.clearCacheWarning'), t('settings.clearCacheTitle'), {
       type: 'warning',
-      customClass: 'settings-cache-clear-dialog',
       confirmButtonText: t('settings.clearCacheConfirm'),
       cancelButtonText: t('common.cancel')
     })

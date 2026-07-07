@@ -50,6 +50,7 @@ export interface AseFrameChunkHeader {
   n_frames_total: number
   n_atoms: number
   topology_stable: boolean
+  frame_encoding?: 'variable-atoms-v1'
   path?: string
   name?: string
   format?: string | null
@@ -70,6 +71,12 @@ export interface AseFrameChunk {
   fixedMask?: Uint8Array
   energy?: Float32Array
   fmax?: Float32Array
+  // Variable-topology (frame_encoding === 'variable-atoms-v1') fields.
+  // positions is flattened to [total_atoms, 3]; numbers/tags/fixedMask are
+  // concatenated by frame with offsets derived from frameAtomCounts prefix sums.
+  frameAtomCounts?: Int32Array
+  numbers?: Int32Array
+  pbc?: Uint8Array
 }
 
 export interface AseFrameJsonChunk {

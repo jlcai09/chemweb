@@ -14,7 +14,7 @@ workspace:
   root: .
   allow_delete: true
   max_upload_size_mb: 1000
-  max_read_size_mb: 50
+  max_read_size_mb: 200
 
 scheduler:
   type: slurm
@@ -30,7 +30,7 @@ viewer:
     max_atoms: 200000
     max_frames: 500000
     max_points_json: 200000
-    binary_chunk_frames: 64
+    binary_chunk_frames: 32
     cache_ttl_minutes: 30
 
 security:

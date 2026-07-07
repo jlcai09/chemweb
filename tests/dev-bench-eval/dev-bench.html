@@ -1,0 +1,1580 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>前端 chunk handler + 后端 SSE 全链路耗时诊断 · v3 (E2E)</title>
+<style>
+  :root {
+    --bg: #f7f8fa;
+    --panel: #fff;
+    --border: #e3e6eb;
+    --accent: #176b87;
+    --accent-hover: #134f64;
+    --accent-soft: rgba(23, 107, 135, 0.10);
+    --warn: #b45309;
+    --bad: #b91c1c;
+    --ok: #15803d;
+    --text: #1f2937;
+    --muted: #6b7280;
+    --c-backend: #b91c1c;
+    --c-network: #7c3aed;
+    --c-feparse: #2563eb;
+    --c-festore: #059669;
+    --c-render: #ea580c;
+    --c-other: #6b7280;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    padding: 22px 28px;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif;
+    max-width: 1320px;
+    margin: 0 auto;
+  }
+  header { margin-bottom: 18px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  h1 { font-size: 22px; margin: 0; letter-spacing: -0.01em; }
+  .sub { color: var(--muted); font-size: 13px; flex: 1; min-width: 360px; }
+  .badge {
+    display: inline-block; padding: 3px 9px; border-radius: 999px;
+    background: var(--accent-soft); color: var(--accent);
+    font-size: 11.5px; font-weight: 600; letter-spacing: 0.02em;
+  }
+  .badge.live { background: rgba(21, 128, 61, 0.12); color: var(--ok); }
+  .badge.fallback { background: rgba(180, 83, 9, 0.12); color: var(--warn); }
+  .badges { display: inline-flex; gap: 6px; flex-wrap: wrap; }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 18px;
+    margin-bottom: 12px;
+  }
+  .panel h2 {
+    font-size: 13px; margin: 0 0 10px; color: #4b5563;
+    font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase;
+  }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  @media (max-width: 920px) { .grid { grid-template-columns: 1fr; } }
+  .drop {
+    border: 2px dashed #cbd5e1;
+    border-radius: 10px;
+    padding: 26px 16px;
+    text-align: center; color: var(--muted);
+    cursor: pointer;
+    transition: border-color .15s, background .15s, color .15s;
+  }
+  .drop:hover, .drop.drag {
+    border-color: var(--accent); background: var(--accent-soft); color: var(--accent);
+  }
+  .drop strong { display: block; font-size: 15px; margin-bottom: 4px; }
+  button {
+    background: var(--accent); color: #fff; border: 0;
+    padding: 8px 14px; border-radius: 6px; cursor: pointer;
+    font-size: 14px; margin-right: 6px; transition: background .15s;
+  }
+  button:hover:not(:disabled) { background: var(--accent-hover); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  button.sec { background: #f1f5f9; color: var(--text); border: 1px solid var(--border); }
+  button.sec:hover:not(:disabled) { background: #e2e8f0; }
+  button.danger { background: var(--bad); }
+  input[type="number"], input[type="text"], select {
+    padding: 6px 8px; border: 1px solid var(--border);
+    border-radius: 5px; font-size: 14px; background: #fff;
+  }
+  input[type="text"] { min-width: 240px; }
+  label.tog {
+    display: inline-flex; align-items: center; gap: 6px;
+    margin: 4px 6px 4px 0; user-select: none; cursor: pointer;
+    padding: 4px 10px; border: 1px solid var(--border);
+    border-radius: 6px; background: #f9fafb; font-size: 13px;
+  }
+  label.tog.live { border-color: var(--ok); background: rgba(21, 128, 61, 0.08); }
+  label.tog input { margin: 0; }
+  label.tog:hover { background: #f1f5f9; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { padding: 6px 10px; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; }
+  th { background: #f9fafb; font-weight: 600; color: #4b5563; font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }
+  td.num { font-variant-numeric: tabular-nums; }
+  code {
+    background: #f1f5f9; padding: 1px 5px; border-radius: 3px;
+    font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: 12.5px;
+  }
+  .stacks-e2e {
+    display: flex; align-items: flex-end; gap: 1px; height: 180px;
+    padding: 6px; background: #f9fafb; border-radius: 6px; overflow-x: auto;
+  }
+  .stacks-e2e > div { min-height: 1px; min-width: 3px; display: flex; flex-direction: column-reverse; border-radius: 1px; }
+  .stacks-e2e > div > div { transition: filter .1s; }
+  .stacks-e2e > div:hover > div { filter: brightness(1.15); }
+  .stage-legend { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; font-size: 12.5px; color: var(--muted); }
+  .stage-legend > span { display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px; background: #f9fafb; border-radius: 4px; }
+  .swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+  .stat-line { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 10px; }
+  .stat-line .pill-stat { background: #f1f5f9; padding: 4px 10px; border-radius: 6px; font-size: 13px; }
+  .stat-line .pill-stat strong { color: var(--accent); font-weight: 600; }
+  .stat-line .pill-stat.warn strong { color: var(--warn); }
+  .stat-line .pill-stat.bad strong { color: var(--bad); }
+  .muted { color: var(--muted); font-size: 12.5px; }
+  .alert { color: var(--warn); font-weight: 600; }
+  .alert.bad { color: var(--bad); }
+  .ok { color: var(--ok); }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+  .grow { flex: 1; min-width: 240px; }
+  footer { color: var(--muted); font-size: 12px; margin-top: 14px; }
+  .large { font-size: 28px; font-weight: 700; color: var(--accent); font-variant-numeric: tabular-nums; letter-spacing: -0.02em; }
+  .stage-table th:first-child { width: 26px; }
+  .groups-row { display: flex; gap: 12px; flex-wrap: wrap; }
+  .group {
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 8px 10px; background: #f9fafb;
+  }
+  .group > .gh {
+    font-size: 11px; color: #6b7280; text-transform: uppercase;
+    letter-spacing: 0.06em; margin-bottom: 4px; font-weight: 600;
+  }
+  .stages-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .stages-table th, .stages-table td { padding: 6px 8px; border-bottom: 1px solid var(--border); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>v3 — SSE chunk handler 全链路耗时诊断（前端 + 后端 + 网络）</h1>
+  <div class="sub" id="sub">
+    离线模式：拖 <code>.xyz</code> 进页内编码 CWB1 chunks → 模拟 SSE chunk handler 全链路<br>
+    E2E 模式：填后端路径 → 调 <code>/api/structures/ase/frames.stream</code> → 后端 event:<code>ready</code>/<code>meta</code>/<code>chunk</code>/<code>done</code> + 浏览器 atob→parse→write 各阶段真实计时
+  </div>
+  <div class="badges" id="badges"></div>
+</header>
+
+<section class="panel">
+  <h2>1. 模式 + 输入</h2>
+  <div class="row">
+    <div>
+      <div class="muted">模式</div>
+      <select id="mode">
+        <option value="sim" selected>离线模式 (本地 .xyz)</option>
+        <option value="e2e">E2E 模式 (调后端 SSE)</option>
+      </select>
+    </div>
+    <span class="muted" id="modeHint">模式下：drag-and-drop .xyz 或点击选择。</span>
+  </div>
+
+  <div id="simInput" style="margin-top: 10px;">
+    <div class="grid">
+      <div class="drop" id="drop"><strong>把 .xyz 拖到这</strong><div class="muted">或点击选</div></div>
+      <div>
+        <div id="fileMeta" class="muted">还没加载。</div>
+        <div style="margin-top: 10px;">
+          <button id="btnReload" class="sec" disabled>↻ 重新读取</button>
+          <button id="btnClear" class="sec" disabled>清空</button>
+        </div>
+      </div>
+    </div>
+    <input type="file" id="fileInput" hidden accept=".xyz,.all">
+  </div>
+
+  <div id="e2eInput" style="margin-top: 10px; display: none;">
+    <div class="row">
+      <div class="grow">
+        <div class="muted">后端路径 (相对 workspace.root)</div>
+        <input type="text" id="e2ePath" placeholder="e.g. idea/tmp/movie.xyz" value="idea/tmp/movie.xyz" style="width: 100%">
+      </div>
+      <div>
+        <div class="muted">chunk size</div>
+        <input type="number" id="e2eChunkSize" value="32" min="1" max="512">
+      </div>
+      <div>
+        <div class="muted">format (可选)</div>
+        <input type="text" id="e2eFormat" placeholder="auto" style="width: 100px">
+      </div>
+      <div style="align-self: flex-end;">
+        <button id="btnE2eRun">▶ E2E Run</button>
+        <button id="btnE2eCancel" class="danger sec" style="display: none; background: var(--bad); color: #fff;">停止</button>
+      </div>
+    </div>
+    <div id="e2eStatus" class="muted" style="margin-top: 8px;">就绪。</div>
+  </div>
+</section>
+
+<section class="panel" id="cfgPanel" style="opacity: .55; pointer-events: none;">
+  <h2>2. 链路 / 阶段 (仅离线模式)</h2>
+  <div class="row">
+    <div>
+      <div class="muted">每事件帧数</div>
+      <select id="chunkSize">
+        <option value="8">8</option>
+        <option value="16">16</option>
+        <option value="32" selected>32</option>
+        <option value="64">64</option>
+        <option value="128">128</option>
+      </select>
+    </div>
+    <div>
+      <div class="muted">重复次数</div>
+      <select id="repeats">
+        <option value="1">1</option>
+        <option value="3" selected>3</option>
+        <option value="5">5</option>
+      </select>
+    </div>
+    <div>
+      <div class="muted">拓扑</div>
+      <select id="topology">
+        <option value="fixed" selected>fixed (TrajectoryStore)</option>
+        <option value="variable">variable (frame_cache · Object 海啸)</option>
+      </select>
+    </div>
+    <div>
+      <div class="muted">真实模块</div>
+      <select id="liveMode">
+        <option value="auto" selected>auto</option>
+        <option value="off">off (纯页内)</option>
+      </select>
+    </div>
+  </div>
+  <div id="perChunkStages" style="margin-top: 12px;">
+    <div class="muted" style="margin-bottom: 4px;">每事件阶段（可在 LIVE 模式下逐个关掉以隔离性能）</div>
+    <div class="groups-row">
+      <div class="group">
+        <div class="gh">SSE 文本解码</div>
+        <div id="stageDecode"></div>
+      </div>
+      <div class="group">
+        <div class="gh">CWB1 二进制解析</div>
+        <div id="stageParse"></div>
+      </div>
+      <div class="group">
+        <div class="gh">写入 store / cache</div>
+        <div id="stageWrite"></div>
+      </div>
+      <div class="group">
+        <div class="gh">viewer 重建 (visible frame)</div>
+        <div id="stageRecon"></div>
+      </div>
+    </div>
+  </div>
+  <div style="margin-top: 14px;">
+    <button id="btnRun" disabled>运行</button>
+    <button id="btnCompare" class="sec" disabled>逐阶段 ON-only 对比</button>
+    <button id="btnExport" class="sec" disabled>导出 JSON</button>
+  </div>
+</section>
+
+<section class="panel" id="resultsPanel" style="display:none;">
+  <h2 id="resultsTitle">3. 运行结果</h2>
+  <div class="row" style="align-items: flex-start;">
+    <div class="grow">
+      <div id="bigTotal" class="large">— ms</div>
+      <div id="bigSub" class="muted">—</div>
+    </div>
+    <div class="grow">
+      <div class="stat-line" id="statLine"></div>
+    </div>
+  </div>
+
+  <div style="margin-top: 14px;">
+    <div class="muted" style="margin-bottom: 6px;">每 chunk 堆叠柱状图（按组分色；hover 看明细）</div>
+    <div id="stacksOffline" class="stacks-e2e" style="display:none"></div>
+    <div id="stacksE2e" class="stacks-e2e" style="display:none"></div>
+    <div id="legend" class="stage-legend"></div>
+  </div>
+
+  <h2 style="margin-top: 18px;">逐阶段汇总</h2>
+  <table class="stages-table">
+    <thead><tr>
+      <th></th><th>阶段</th><th>组</th>
+      <th class="num">avg/chunk</th><th class="num">total</th>
+      <th class="num">占 total %</th><th class="num">max</th>
+      <th class="num">min</th><th class="num">last</th>
+    </tr></thead>
+    <tbody id="stageTbody"></tbody>
+  </table>
+
+  <div id="hint" style="margin-top: 14px;"></div>
+</section>
+
+<section class="panel" id="historyPanel" style="display:none;">
+  <h2>历史运行</h2>
+  <table id="runs">
+    <thead><tr>
+      <th>#</th><th>场景</th><th>chunk×N</th>
+      <th class="num">total</th>
+      <th class="num">前端 MB/s</th>
+      <th class="num">top1 阶段</th><th class="num">top1 ms/chunk</th>
+    </tr></thead>
+    <tbody></tbody>
+  </table>
+</section>
+
+<section class="panel" id="exportPanel" style="display:none;">
+  <h2>导出</h2>
+  <textarea id="exportArea" readonly style="width:100%;height:140px;padding:10px;border:1px solid var(--border);border-radius:6px;font-family:ui-monospace,Consolas,monospace;font-size:12px;"></textarea>
+</section>
+
+<footer>
+  <b>v3 说明</b>：
+  <ul style="margin: 4px 0 0 0; padding-left: 22px; line-height: 1.55;">
+    <li><b>离线模式 (sim)</b>：v2 行为不变，本地编码 CWB1 chunks 后模拟 SSE chunk handler；不涉及后端/网络。</li>
+    <li><b>E2E 模式</b>：动态 <code>import('/src/api/structures.ts')</code> 在 Vite dev 下连真后端；后端在 <code>backend/app/api/structures.py</code> 已升级，新增 <code>event: ready</code>（含 <code>t_resolve</code>、<code>t_scan</code>、<code>server_emit_ms</code>）和每个 <code>event: meta</code>（含 <code>t_pack</code>、<code>t_b64</code>、<code>server_emit_ms</code>、<code>size_b64</code>）紧跟 <code>event: chunk</code> 之前。</li>
+    <li><b>时钟对齐</b>：loopback skey 假设小。首次 <code>ready</code> 事件的 client 接收时间和 server_emit_ms 差值作为 <code>drift</code>；所有 meta 用 <code>client_recv - (server_emit + drift)</code> 计算网络 drift。仅在 loopback 上有完整 ground truth。</li>
+    <li><b>5 个 group 颜色</b>：<span class="swatch" style="background:var(--c-backend)"></span> 后端 · <span class="swatch" style="background:var(--c-network)"></span> 网络 drift · <span class="swatch" style="background:var(--c-feparse)"></span> 前端解析 · <span class="swatch" style="background:var(--c-festore)"></span> 前端存储 · <span class="swatch" style="background:var(--c-render)"></span> 渲染。</li>
+  </ul>
+</footer>
+
+<script type="module">
+'use strict'
+
+// ========================== Epoch offset (page-load) ==================
+// Server timestamps use time.time() (epoch ms); client uses performance.now()
+// (monotonic since navigation). Capture the offset at page-load so per-event
+// arithmetic can compare both clocks in the same ms-base.
+const EPOCH_OFFSET_AT_LOAD = Date.now() - performance.now()
+
+// ========================== Helpers ====================================
+const $ = id => document.getElementById(id)
+const drop = $('drop'), fileInput = $('fileInput')
+const modeEl = $('mode'), modeHint = $('modeHint')
+const simInputEl = $('simInput'), e2eInputEl = $('e2eInput')
+const cfgPanel = $('cfgPanel'), resultsPanel = $('resultsPanel'), historyPanel = $('historyPanel'), exportPanel = $('exportPanel')
+const btnRun = $('btnRun'), btnReload = $('btnReload'), btnClear = $('btnClear'), btnCompare = $('btnCompare'), btnExport = $('btnExport')
+const btnE2eRun = $('btnE2eRun'), btnE2eCancel = $('btnE2eCancel')
+const e2eStatusEl = $('e2eStatus')
+const fileMetaEl = $('fileMeta'), bigTotal = $('bigTotal'), bigSub = $('bigSub')
+const stacksOfflineEl = $('stacksOffline'), stacksE2eEl = $('stacksE2e'), legendEl = $('legend'), statLineEl = $('statLine'), hintEl = $('hint')
+const stageTbody = $('stageTbody'), runsBody = document.querySelector('#runs tbody')
+const exportArea = $('exportArea'), badgesEl = $('badges')
+const stageDecodeEl = $('stageDecode'), stageParseEl = $('stageParse'), stageWriteEl = $('stageWrite'), stageReconEl = $('stageRecon')
+
+function fmt(ms) {
+  if (ms == null || !Number.isFinite(ms)) return '—'
+  if (ms >= 1000) return (ms / 1000).toFixed(2) + ' s'
+  return ms.toFixed(2)
+}
+function safe(s) { return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;') }
+
+// ========================== Mode switch ================================
+let mode = 'sim'
+function applyMode() {
+  if (mode === 'e2e') {
+    simInputEl.style.display = 'none'
+    e2eInputEl.style.display = ''
+    modeHint.textContent = 'E2E 模式下：填写后端路径并按 E2E Run；要求 Python 后端在跑。'
+    cfgPanel.style.opacity = '.35'
+    cfgPanel.style.pointerEvents = 'none'
+  } else {
+    simInputEl.style.display = ''
+    e2eInputEl.style.display = 'none'
+    modeHint.textContent = '离线模式下：drag-and-drop .xyz 或点击选择。'
+    cfgPanel.style.opacity = ''
+    cfgPanel.style.pointerEvents = ''
+  }
+}
+modeEl.addEventListener('change', () => { mode = modeEl.value; applyMode() })
+applyMode()
+
+// ========================== Live module loading ========================
+const liveModules = { structuresMod: null, trajectoryMod: null, errors: {} }
+async function tryImport(spec, key) {
+  try { const mod = await import(spec); liveModules[key] = mod; return true }
+  catch (e) { liveModules.errors[key] = e?.message || String(e); liveModules[key] = null; return false }
+}
+try { await Promise.all([
+  tryImport('/src/api/structures.ts', 'structuresMod'),
+  tryImport('/src/viewer/TrajectoryStore.ts', 'trajectoryMod'),
+]) } catch (_) {}
+function renderBadges() {
+  badgesEl.innerHTML = ''
+  const items = [
+    { key: 'structuresMod', name: 'structures.ts' },
+    { key: 'trajectoryMod', name: 'TrajectoryStore' },
+  ]
+  for (const it of items) {
+    const ok = !!liveModules[it.key]
+    const span = document.createElement('span')
+    span.className = 'badge ' + (ok ? 'live' : 'fallback')
+    span.textContent = (ok ? 'LIVE' : 'FALLBACK') + ' · ' + it.name
+    badgesEl.appendChild(span)
+  }
+}
+renderBadges()
+function isLiveMode() { return !!(liveModules.structuresMod && liveModules.trajectoryMod) }
+
+// ========================== Stages registry ============================
+const STAGES = [
+  { id: 'encode_xyz',  label: 'encode_xyz (一次性)',  color: '#94a3b8', perChunk: false, group: 'festore' },
+  { id: 'b64_encode',  label: 'b64_encode (一次性)',  color: '#64748b', perChunk: false, group: 'festore' },
+  { id: 'atob',        label: 'Browser · atob',      color: '#0ea5e9', perChunk: true,  group: 'feparse' },
+  { id: 'b64_to_bytes',label: 'Browser · 1-字符 charCodeAt 循环', color: '#0284c7', perChunk: true,  group: 'feparse' },
+  { id: 'cwb1_magic',  label: 'CWB1 magic',       color: '#2563eb', perChunk: true,  group: 'feparse', liveCaps: 'fallback' },
+  { id: 'cwb1_header', label: 'CWB1 header JSON.parse', color: '#4338ca', perChunk: true,  group: 'feparse', liveCaps: 'fallback' },
+  { id: 'cwb1_views',  label: 'CWB1 建立 views', color: '#7c3aed', perChunk: true,  group: 'feparse', liveCaps: 'fallback' },
+  { id: 'cwb1_parse',  label: 'parseStructureBinaryChunk (LIVE 黑盒)', color: '#1e40af', perChunk: true, group: 'feparse', liveCaps: 'live' },
+  { id: 'write_chunk', label: 'writeChunkToStore (TypedArray.set + 标记 + viewer.setFrame)', color: '#a21caf', perChunk: true, group: 'festore' },
+  { id: 'write_var',   label: 'writeVariableChunkToCache (variable)', color: '#86198f', perChunk: true, group: 'festore' },
+  { id: 'frame_recon_fixed',  label: 'frameFromTrajectoryStore', color: '#c026d3', perChunk: true, group: 'render', liveCaps: 'live' },
+  { id: 'frame_recon_variable', label: 'frameFromVariableStructureChunk', color: '#a21caf', perChunk: true, group: 'render', liveCaps: 'live' },
+  { id: 'build_display', label: 'buildDisplayFrame', color: '#db2777', perChunk: true, group: 'render' },
+  { id: 'estimate_bonds', label: 'estimateBonds 27-邻居', color: '#e11d48', perChunk: true, group: 'render' },
+]
+const GROUP_COLORS = { backend: '#b91c1c', network: '#7c3aed', feparse: '#2563eb', festore: '#059669', render: '#ea580c' }
+const GROUP_ORDER = ['backend', 'network', 'feparse', 'festore', 'render']
+
+function syncStageUi() {
+  for (const el of [stageDecodeEl, stageParseEl, stageWriteEl, stageReconEl]) el.innerHTML = ''
+  const topology = $('topology').value
+  const liveOn = isLiveMode()
+  for (const s of STAGES) {
+    if (s.perChunk === false) continue
+    if ((s.id === 'write_var' || s.id === 'frame_recon_variable') && topology !== 'variable') continue
+    if (s.id === 'frame_recon_fixed' && topology !== 'fixed') continue
+    const el = s.group === 'feparse' ? stageDecodeEl
+             : s.group === 'feparse' ? stageDecodeEl
+             : s.group === 'festore' ? stageWriteEl
+             : s.group === 'render' ? stageReconEl
+             : stageParseEl
+    const isLive = liveOn && (s.id === 'cwb1_parse' || s.liveCaps === 'live')
+    const label = document.createElement('label')
+    label.className = 'tog' + (isLive ? ' live' : '')
+    if (s.note) label.title = s.note
+    const cb = document.createElement('input'); cb.type = 'checkbox'; cb.id = 'st_' + s.id
+    let checked = true
+    if (liveOn && (s.id === 'cwb1_magic' || s.id === 'cwb1_header' || s.id === 'cwb1_views')) { checked = false; cb.disabled = true }
+    if (!liveOn && s.id === 'cwb1_parse') { checked = false; cb.disabled = true }
+    cb.checked = checked
+    const dot = document.createElement('span'); dot.className = 'swatch'; dot.style.background = s.color
+    label.appendChild(cb); label.appendChild(dot)
+    label.appendChild(document.createTextNode(' ' + s.label))
+    el.appendChild(label)
+  }
+}
+syncStageUi()
+$('liveMode').addEventListener('change', () => { currentChunks = null; syncStageUi() })
+$('topology').addEventListener('change', () => { currentChunks = null; syncStageUi() })
+$('chunkSize').addEventListener('change', () => { currentChunks = null; renderFileMeta() })
+
+// ========================== State ======================================
+let currentBuffer = null, currentText = null, currentLines = null, currentMeta = null
+let currentChunks = null
+let lastRun = null, runs = []
+let e2eState = null
+
+// ========================== File input / XYZ parser ====================
+function decodeUtf8(buffer) {
+  const u8 = new Uint8Array(buffer, 0, Math.min(3, buffer.byteLength))
+  const hasBom = u8.length === 3 && u8[0] === 0xEF && u8[1] === 0xBB && u8[2] === 0xBF
+  return new TextDecoder('utf-8').decode(hasBom ? buffer.slice(3) : buffer)
+}
+
+drop.addEventListener('click', () => fileInput.click())
+drop.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('drag') })
+drop.addEventListener('dragleave', () => drop.classList.remove('drag'))
+drop.addEventListener('drop', e => { e.preventDefault(); drop.classList.remove('drag'); const f = e.dataTransfer.files[0]; if (f) handleFile(f) })
+fileInput.addEventListener('change', e => { const f = e.target.files[0]; if (f) handleFile(f) })
+
+async function handleFile(file) {
+  const tRead0 = performance.now()
+  const buf = await file.arrayBuffer()
+  const tRead = performance.now() - tRead0
+  const text = decodeUtf8(buf)
+  const lines = text.split('\n')
+  const meta = fastCount(lines)
+  if (meta.frameCount === 0) {
+    fileMetaEl.innerHTML = '<div class="alert bad">无法识别 XYZ 帧头。</div>'
+    return
+  }
+  currentBuffer = buf; currentText = text; currentLines = lines
+  currentMeta = { ...meta, bytes: buf.byteLength, fileReadMs: tRead, name: file.name, eventsAt16: Math.max(0, Math.ceil(meta.frameCount / 16)) }
+  currentChunks = null
+  runs = []; runsBody.innerHTML = ''; lastRun = null
+  renderFileMeta()
+  cfgPanel.style.opacity = '1'; cfgPanel.style.pointerEvents = ''
+  btnRun.disabled = false; btnReload.disabled = false; btnClear.disabled = false
+  btnCompare.disabled = false; btnExport.disabled = false
+}
+
+function fastCount(lines) {
+  let atomsPerFrame = -1, frameCount = 0, lastN = -1
+  let i = 0
+  while (i < lines.length) {
+    const trimmed = lines[i].trim()
+    if (trimmed.length === 0) { i += 1; continue }
+    const n = parseInt(trimmed, 10)
+    if (Number.isFinite(n) && n > 0 && n <= 1000000 && trimmed === String(n)) {
+      if (atomsPerFrame === -1) atomsPerFrame = n
+      lastN = n; i += 2 + n; frameCount += 1
+    } else { i += 1 }
+  }
+  return { atomsPerFrame, frameCount, lastN }
+}
+
+function renderFileMeta() {
+  const m = currentMeta
+  if (!m) { fileMetaEl.innerHTML = '<div>还没加载。</div><div class="muted">拖 <code>.xyz</code> 到上面虚线框即可。</div><div id="fileError" class="alert bad" style="margin-top:6px; display:none;"></div>'; return }
+  const mb = m.bytes / (1024 * 1024)
+  const chunkSizeNow = parseInt($('chunkSize').value, 10) || 32
+  const eventsNow = Math.ceil(m.frameCount / chunkSizeNow)
+  const actual = lastRun && lastRun.cfg && lastRun.summary && lastRun.summary.total ? { n: lastRun.summary.total.n, chunkSize: lastRun.cfg.chunkSize } : null
+  fileMetaEl.innerHTML = `
+    <div><b>${safe(m.name)}</b> · <code>${mb.toFixed(2)} MB</code></div>
+    <div>${m.atomsPerFrame.toLocaleString()} atoms × ${m.frameCount.toLocaleString()} frames · 总 ${(m.atomsPerFrame * m.frameCount).toLocaleString()} 原子</div>
+    <div>当前 chunkSize=<b>${chunkSizeNow}</b> ⇒ <b style="color:var(--accent)">${eventsNow}</b> 应跑出${actual ? ' · 上次跑出 <b>' + actual.n + '</b> 事件 @ chunkSize=<b>' + actual.chunkSize + '</b>' + (actual.chunkSize !== chunkSizeNow ? ' <span class="alert">— 不同于当前 dropdown，需重跑</span>' : ' <span class="ok">✓ 同 chunkSize</span>') : ' · <span class="muted">未跑过</span>'}</div>
+    <div class="muted">FileReader.arrayBuffer()：<code>${fmt(m.fileReadMs)} ms</code> · ${(mb / (m.fileReadMs/1000)).toFixed(1)} MB/s</div>
+    <div id="fileError" class="alert bad" style="display:none; margin-top: 6px;"></div>
+  `
+}
+
+// ========================== CWB1 chunk encoders ========================
+function precomputeAllPositions() {
+  if (!currentLines || !currentMeta) return null
+  const atomsPerFrame = currentMeta.atomsPerFrame
+  const totalFrames = currentMeta.frameCount
+  const arr = new Float32Array(totalFrames * atomsPerFrame * 3)
+  let i = 0, frame = 0
+  while (i < currentLines.length && frame < totalFrames) {
+    const trimmed = currentLines[i].trim()
+    const n = parseInt(trimmed, 10)
+    if (!Number.isFinite(n) || n <= 0 || trimmed !== String(n)) { i += 1; continue }
+    i += 1
+    const atomOffset = frame * atomsPerFrame * 3
+    const a = Math.min(n, atomsPerFrame)
+    for (let k = 0; k < a; k += 1) {
+      const line = currentLines[i]
+      const p1 = line.indexOf(' '), p2 = line.indexOf(' ', p1 + 1), p3 = line.indexOf(' ', p2 + 1)
+      const off = atomOffset + k * 3
+      arr[off]     = parseFloat(line.substring(p1 + 1, p2))
+      arr[off + 1] = parseFloat(line.substring(p2 + 1, p3))
+      arr[off + 2] = parseFloat(line.substring(p3 + 1))
+      i += 1
+    }
+    i += (n - a); frame += 1
+  }
+  return arr
+}
+
+function ensureChunks() {
+  if (currentChunks && currentChunks.length > 0) return currentChunks
+  if (!currentLines || !currentMeta) return null
+  const atomCount = currentMeta.atomsPerFrame
+  const totalFrames = currentMeta.frameCount
+  if (!(atomCount > 0) || !(totalFrames > 0)) return null
+  const chunkSize = parseInt($('chunkSize').value, 10)
+  if (!(chunkSize > 0)) return null
+  currentChunks = null
+  const topology = $('topology').value
+  const allPositions = precomputeAllPositions()
+  const chunks = []
+  if (topology === 'fixed') {
+    const symbols = new Array(atomCount).fill('C')
+    const numbers = new Array(atomCount).fill(6)
+    const pbc = [true, true, true]
+    for (let start = 0; start < totalFrames; start += chunkSize) {
+      const count = Math.min(chunkSize, totalFrames - start)
+      chunks.push(buildFixedChunk(start, count, atomCount, totalFrames, symbols, numbers, pbc, allPositions))
+    }
+  } else {
+    for (let start = 0; start < totalFrames; start += chunkSize) {
+      const count = Math.min(chunkSize, totalFrames - start)
+      chunks.push(buildVariableChunk(start, count, atomCount, totalFrames, allPositions))
+    }
+  }
+  currentChunks = chunks; return chunks
+}
+
+function buildFixedChunk(start, count, atomsPerFrame, totalFrames, symbols, numbers, pbc, allPositions) {
+  const posLen = count * atomsPerFrame * 3 * 4
+  const cellLen = count * 9 * 4
+  const tagLen = count * atomsPerFrame * 4
+  const energyLen = count * 4
+  const fmaxLen = count * 4
+  const maskLen = count * atomsPerFrame
+  const header = { version: 1, dtype: 'float32-le', int_dtype: 'int32-le', start, count, n_frames_total: totalFrames, n_atoms: atomsPerFrame, topology_stable: true, path: currentMeta.name, name: currentMeta.name, format: 'xyz', symbols, numbers, pbc, nan_means_null: ['energy','fmax'] }
+  const arrays = {
+    positions: { offset: 0, byte_length: posLen, shape: [count, atomsPerFrame, 3] },
+    cells:     { offset: posLen, byte_length: cellLen, shape: [count, 3, 3] },
+    tags:      { offset: posLen + cellLen, byte_length: tagLen, shape: [count, atomsPerFrame] },
+    energy:    { offset: posLen + cellLen + tagLen, byte_length: energyLen, shape: [count] },
+    fmax:      { offset: posLen + cellLen + tagLen + energyLen, byte_length: fmaxLen, shape: [count] },
+    fixed_mask:{ offset: posLen + cellLen + tagLen + energyLen + fmaxLen, byte_length: maskLen, shape: [count, atomsPerFrame] },
+  }
+  header.arrays = arrays
+  const totalPayload = posLen + cellLen + tagLen + energyLen + fmaxLen + maskLen
+  return assembleChunk(header, totalPayload, (u8, dataStart) => {
+    const f32 = new Float32Array(u8.buffer, dataStart, count * atomsPerFrame * 3)
+    const base = start * atomsPerFrame * 3
+    f32.set(allPositions.subarray(base, base + count * atomsPerFrame * 3))
+    new Float32Array(u8.buffer, dataStart + posLen, count * 9)
+    new Int32Array(u8.buffer, dataStart + posLen + cellLen, count * atomsPerFrame)
+    new Float32Array(u8.buffer, dataStart + posLen + cellLen + tagLen, count).fill(NaN)
+    new Float32Array(u8.buffer, dataStart + posLen + cellLen + tagLen + energyLen, count).fill(NaN)
+  })
+}
+
+function buildVariableChunk(start, count, atomsPerFrame, totalFrames, allPositions) {
+  const frameAtomCounts = new Int32Array(count)
+  for (let i = 0; i < count; i += 1) frameAtomCounts[i] = atomsPerFrame
+  const numbers = new Int32Array(atomsPerFrame).fill(6)
+  const posLen = count * atomsPerFrame * 3 * 4, cellLen = count * 9 * 4, tagLen = count * atomsPerFrame * 4, maskLen = count * atomsPerFrame
+  const energyLen = count * 4, fmaxLen = count * 4, pbcLen = count * 3
+  const facOffset = 0, numOffset = facOffset + count * 4, posOffset = numOffset + atomsPerFrame * 4
+  const cellOffset = posOffset + posLen, tagOffset = cellOffset + cellLen, maskOffset = tagOffset + tagLen
+  const pbcOffset = maskOffset + maskLen, energyOffset = pbcOffset + pbcLen, fmaxOffset = energyOffset + energyLen
+  const totalPayload = fmaxOffset + fmaxLen
+  const header = {
+    version: 1, dtype: 'float32-le', int_dtype: 'int32-le',
+    start, count, n_frames_total: totalFrames, n_atoms: atomsPerFrame,
+    topology_stable: false, frame_encoding: 'variable-atoms-v1',
+    pbc: [true, true, true], path: currentMeta.name, name: currentMeta.name, format: 'xyz',
+    nan_means_null: ['energy','fmax'],
+    arrays: {
+      frame_atom_counts: { offset: facOffset, byte_length: count * 4, shape: [count] },
+      numbers:           { offset: numOffset, byte_length: atomsPerFrame * 4, shape: [atomsPerFrame] },
+      positions:         { offset: posOffset, byte_length: posLen, shape: [count * atomsPerFrame, 3] },
+      cells:             { offset: cellOffset, byte_length: cellLen, shape: [count, 3, 3] },
+      tags:              { offset: tagOffset, byte_length: tagLen, shape: [count * atomsPerFrame] },
+      fixed_mask:        { offset: maskOffset, byte_length: maskLen, shape: [count * atomsPerFrame] },
+      pbc:               { offset: pbcOffset, byte_length: pbcLen, shape: [count, 3] },
+      energy:            { offset: energyOffset, byte_length: energyLen, shape: [count] },
+      fmax:              { offset: fmaxOffset, byte_length: fmaxLen, shape: [count] },
+    }
+  }
+  return assembleChunk(header, totalPayload, (u8, dataStart) => {
+    const base = start * atomsPerFrame * 3
+    new Int32Array(u8.buffer, dataStart + facOffset, count).set(frameAtomCounts)
+    new Int32Array(u8.buffer, dataStart + numOffset, atomsPerFrame).set(numbers)
+    new Float32Array(u8.buffer, dataStart + posOffset, count * atomsPerFrame * 3)
+      .set(allPositions.subarray(base, base + count * atomsPerFrame * 3))
+    new Float32Array(u8.buffer, dataStart + cellOffset, count * 9)
+    new Int32Array(u8.buffer, dataStart + tagOffset, count * atomsPerFrame)
+    new Uint8Array(u8.buffer, dataStart + pbcOffset, count * 3).fill(1)
+    new Float32Array(u8.buffer, dataStart + energyOffset, count).fill(NaN)
+    new Float32Array(u8.buffer, dataStart + fmaxOffset, count).fill(NaN)
+  })
+}
+
+function assembleChunk(header, totalPayload, fill) {
+  const headerStr = JSON.stringify(header)
+  const headerBytes = new TextEncoder().encode(headerStr)
+  const headerPadding = (4 - (headerBytes.length % 4)) % 4
+  const payloadPadding = (4 - (totalPayload % 4)) % 4
+  const totalSize = 4 + 4 + headerBytes.length + headerPadding + totalPayload + payloadPadding
+  const buf = new ArrayBuffer(totalSize)
+  const u8 = new Uint8Array(buf)
+  u8[0] = 0x43; u8[1] = 0x57; u8[2] = 0x42; u8[3] = 0x31
+  new DataView(buf).setUint32(4, headerBytes.length, true)
+  u8.set(headerBytes, 8)
+  const dataStart = 8 + headerBytes.length + headerPadding
+  fill(u8, dataStart)
+  let binary = ''
+  const CHUNK = 0x8000
+  for (let k = 0; k < u8.length; k += CHUNK) binary += String.fromCharCode.apply(null, u8.subarray(k, k + CHUNK))
+  return {
+    start: header.start, count: header.count,
+    cwb1: u8,
+    b64: btoa(binary),
+    isVariable: !!header.frame_encoding,
+  }
+}
+
+// ========================== Local mirrors for SIM mode ==================
+const NUMBER_SYMBOLS_LOCAL = [
+  'X','H','He','Li','Be','B','C','N','O','F','Ne','Na','Mg','Al','Si','P','S','Cl','Ar','K','Ca',
+  'Sc','Ti','V','Cr','Mn','Fe','Co','Ni','Cu','Zn','Ga','Ge','As','Se','Br','Kr','Rb','Sr','Y','Zr',
+  'Nb','Mo','Tc','Ru','Rh','Pd','Ag','Cd','In','Sn','Sb','Te','I','Xe','Cs','Ba','La','Ce','Pr','Nd',
+  'Pm','Sm','Eu','Gd','Tb','Dy','Ho','Er','Tm','Yb','Lu','Hf','Ta','W','Re','Os','Ir','Pt','Au','Hg',
+  'Tl','Pb','Bi','Po','At','Rn','Fr','Ra','Ac','Th','Pa','U','Np','Pu','Am','Cm','Bk','Cf','Es','Fm',
+  'Md','No','Lr','Rf','Db','Sg','Bh','Hs','Mt','Ds','Rg','Cn','Nh','Fl','Mc','Lv','Ts','Og'
+]
+const COVALENT_RADII_BY_NUMBER_LOCAL = [
+  null,0.31,0.28,1.28,0.96,0.84,0.76,0.71,0.66,0.57,0.58,1.66,1.41,1.21,1.11,1.07,1.05,1.02,1.06,2.03,1.76,
+  1.7,1.6,1.53,1.39,1.39,1.32,1.26,1.24,1.32,1.22,1.22,1.2,1.19,1.2,1.2,1.16,2.2,1.95,1.9,1.75,1.64,1.54,
+  1.47,1.46,1.42,1.39,1.45,1.44,1.42,1.39,1.39,1.38,1.39,1.4,2.44,2.15,2.07,2.04,2.03,2.01,1.99,1.98,1.98,
+  1.96,1.94,1.92,1.92,1.89,1.9,1.87,1.87,1.75,1.7,1.62,1.51,1.44,1.41,1.36,1.36,1.32,1.45,1.46,1.48,1.4,
+  1.5,1.5,2.6,2.21,2.15,2.06,2,1.96,1.9,1.87,1.8,1.69,
+  null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null,null
+]
+const COVALENT_RADIUS_BY_SYMBOL_LOCAL = Object.fromEntries(
+  NUMBER_SYMBOLS_LOCAL.map((s, i) => COVALENT_RADII_BY_NUMBER_LOCAL[i] != null ? [s, COVALENT_RADII_BY_NUMBER_LOCAL[i]] : null).filter(Boolean)
+)
+const DEFAULT_COVALENT_RADIUS_LOCAL = 0.8
+
+function estimateBondsLocal(frame, bondScale) {
+  const nAtoms = frame.nAtoms
+  const bonds = []
+  if (nAtoms < 2 || nAtoms > 50000) return bonds
+  const positions = frame.positions, symbols = frame.symbols
+  const cellSize = 2.4
+  const buckets = new Map()
+  const bucketKeys = new Array(nAtoms)
+  for (let i = 0; i < nAtoms; i += 1) {
+    const off = i * 3
+    const ix = Math.floor((positions[off] ?? 0) / cellSize), iy = Math.floor((positions[off + 1] ?? 0) / cellSize), iz = Math.floor((positions[off + 2] ?? 0) / cellSize)
+    bucketKeys[i] = [ix, iy, iz]
+    const key = ix + ',' + iy + ',' + iz
+    const b = buckets.get(key); if (b) b.push(i); else buckets.set(key, [i])
+  }
+  const maxBonds = nAtoms * 8
+  const sample = sym => COVALENT_RADIUS_BY_SYMBOL_LOCAL[sym] ?? DEFAULT_COVALENT_RADIUS_LOCAL
+  for (let i = 0; i < nAtoms && bonds.length < maxBonds; i += 1) {
+    const [ix, iy, iz] = bucketKeys[i]
+    const lo = positions[i*3], la = positions[i*3+1], la2 = positions[i*3+2]
+    const li = sample(symbols[i])
+    for (let dx = -1; dx <= 1 && bonds.length < maxBonds; dx += 1)
+      for (let dy = -1; dy <= 1 && bonds.length < maxBonds; dy += 1)
+        for (let dz = -1; dz <= 1 && bonds.length < maxBonds; dz += 1) {
+          const bucket = buckets.get((ix+dx)+','+(iy+dy)+','+(iz+dz))
+          if (!bucket) continue
+          for (let k = 0; k < bucket.length; k += 1) {
+            const j = bucket[k]
+            if (j <= i) continue
+            const ro = positions[j*3], ra = positions[j*3+1], rb = positions[j*3+2]
+            const dxd = lo - ro, dyd = la - ra, dzd = la2 - rb
+            const d2 = dxd*dxd + dyd*dyd + dzd*dzd
+            if (d2 < 0.16) continue
+            const rj = sample(symbols[j])
+            const cutoff = Math.max(0.45, (li + rj) * bondScale + 0.18)
+            if (d2 <= cutoff * cutoff) bonds.push({ a: i, b: j })
+            if (bonds.length >= maxBonds) break
+          }
+        }
+  }
+  return bonds
+}
+
+function makeTrajectoryStore(nAtoms, nFrames) {
+  return {
+    nAtoms, nFrames,
+    symbols: ['C'], numbers: [6],
+    positions: new Float32Array(nFrames * nAtoms * 3),
+    cells: new Float32Array(nFrames * 9),
+    tags: new Int32Array(nFrames * nAtoms),
+    fixedMask: new Uint8Array(nFrames * nAtoms),
+    energy: new Float32Array(nFrames).fill(NaN),
+    fmax: new Float32Array(nFrames).fill(NaN),
+    pbc: [true, true, true],
+    availableFrames: new Uint8Array(nFrames),
+    initialFrameIndex: 0,
+  }
+}
+
+function writeChunkToStoreLocal(chunk, store, doSetFrame, setFrameFn) {
+  if (!chunk || !store) return
+  const start = chunk.header?.start
+  const count = chunk.header?.count
+  const nAtoms = chunk.header?.n_atoms
+  if (nAtoms !== store.nAtoms || start == null || count == null) return
+  store.positions.set(chunk.positions, start * nAtoms * 3)
+  if (store.cells && chunk.cells) store.cells.set(chunk.cells, start * 9)
+  if (store.tags && chunk.tags) store.tags.set(chunk.tags, start * nAtoms)
+  if (store.fixedMask && chunk.fixedMask) store.fixedMask.set(chunk.fixedMask, start * nAtoms)
+  if (store.energy && chunk.energy) store.energy.set(chunk.energy, start)
+  if (store.fmax && chunk.fmax) store.fmax.set(chunk.fmax, start)
+  store.symbols = chunk.header.symbols
+  store.numbers = chunk.header.numbers
+  store.pbc = chunk.header.pbc
+  for (let i = 0; i < count; i += 1) {
+    if (store.availableFrames) store.availableFrames[start + i] = 1
+  }
+  if (doSetFrame && setFrameFn) setFrameFn(start + count - 1)
+}
+
+// ========================== Per-chunk handler (SIM mode) ==============
+function emptyStageTimes() {
+  const o = {}; for (const s of STAGES) o[s.id] = 0; return o
+}
+
+function runChunkHandler(opts) {
+  const { stages, chunk, store, frameIndex, liveNow } = opts
+  const t = emptyStageTimes()
+  let buffer = null, parsed = null
+
+  if (stages.atob) { const t0 = performance.now(); atob(chunk.b64); t.atob = performance.now() - t0 }
+  if (stages.b64_to_bytes) {
+    const t0 = performance.now()
+    const s = atob(chunk.b64); const bytes = new Uint8Array(s.length)
+    for (let i = 0; i < s.length; i += 1) bytes[i] = s.charCodeAt(i)
+    buffer = bytes.buffer
+    t.b64_to_bytes = performance.now() - t0
+  }
+  if (!buffer && (stages.cwb1_magic || stages.cwb1_header || stages.cwb1_views || stages.cwb1_parse || stages.write_chunk)) {
+    const s = atob(chunk.b64); const bytes = new Uint8Array(s.length)
+    for (let i = 0; i < s.length; i += 1) bytes[i] = s.charCodeAt(i)
+    buffer = bytes.buffer
+  }
+  if (liveNow && liveModules.structuresMod) {
+    if (stages.cwb1_parse) {
+      const t0 = performance.now()
+      try { parsed = liveModules.structuresMod.parseStructureBinaryChunk(buffer) } catch (e) {}
+      t.cwb1_parse = performance.now() - t0
+    }
+  } else {
+    if (stages.cwb1_magic) {
+      const t0 = performance.now()
+      const u8 = new Uint8Array(buffer, 0, 4)
+      const s = String.fromCharCode(u8[0], u8[1], u8[2], u8[3])
+      if (s !== 'CWB1') throw new Error('bad magic')
+      t.cwb1_magic = performance.now() - t0
+    }
+    if (stages.cwb1_header) {
+      const view = new DataView(buffer)
+      const headerLen = view.getUint32(4, true)
+      const t0 = performance.now()
+      JSON.parse(new TextDecoder().decode(new Uint8Array(buffer, 8, headerLen)))
+      t.cwb1_header = performance.now() - t0
+    }
+    if (stages.cwb1_views) {
+      const view = new DataView(buffer); const headerLen = view.getUint32(4, true)
+      const dataStart = 8 + headerLen + ((4 - (headerLen % 4)) % 4)
+      const header = JSON.parse(new TextDecoder().decode(new Uint8Array(buffer, 8, headerLen)))
+      const t0 = performance.now()
+      new Float32Array(buffer, dataStart + header.arrays.positions.offset, header.arrays.positions.byte_length / 4)
+      if (header.arrays.cells) new Float32Array(buffer, dataStart + header.arrays.cells.offset, header.arrays.cells.byte_length / 4)
+      if (header.arrays.tags) new Int32Array(buffer, dataStart + header.arrays.tags.offset, header.arrays.tags.byte_length / 4)
+      if (header.arrays.fixed_mask) new Uint8Array(buffer, dataStart + header.arrays.fixed_mask.offset, header.arrays.fixed_mask.byte_length)
+      t.cwb1_views = performance.now() - t0
+    }
+    if (!parsed && stages.write_chunk) {
+      const view = new DataView(buffer); const headerLen = view.getUint32(4, true)
+      const dataStart = 8 + headerLen + ((4 - (headerLen % 4)) % 4)
+      const header = JSON.parse(new TextDecoder().decode(new Uint8Array(buffer, 8, headerLen)))
+      parsed = {
+        header, buffer, dataStart,
+        positions: new Float32Array(buffer, dataStart + header.arrays.positions.offset, header.arrays.positions.byte_length / 4),
+        cells: header.arrays.cells ? new Float32Array(buffer, dataStart + header.arrays.cells.offset, header.arrays.cells.byte_length / 4) : new Float32Array(),
+        tags: header.arrays.tags ? new Int32Array(buffer, dataStart + header.arrays.tags.offset, header.arrays.tags.byte_length / 4) : undefined,
+        fixedMask: header.arrays.fixed_mask ? new Uint8Array(buffer, dataStart + header.arrays.fixed_mask.offset, header.arrays.fixed_mask.byte_length) : undefined,
+      }
+    }
+  }
+  if (stages.write_chunk && parsed && store) {
+    const t0 = performance.now()
+    writeChunkToStoreLocal(parsed, store, true, (frameIdx) => {
+      if (stages.frame_recon_fixed && store) {
+        const a = performance.now()
+        const liveFrame = (liveNow && liveModules.trajectoryMod) ? liveModules.trajectoryMod.frameFromTrajectoryStore(store, frameIdx) : null
+        if (liveFrame) {
+          t.frame_recon_fixed += performance.now() - a
+          if (stages.estimate_bonds) {
+            const a2 = performance.now()
+            estimateBondsLocal({ nAtoms: liveFrame.positions.length / 3, positions: liveFrame.positions, symbols: liveFrame.symbols }, 1.25)
+            t.estimate_bonds += performance.now() - a2
+          }
+        }
+      }
+    })
+    t.write_chunk = performance.now() - t0
+  }
+  if (stages.build_display && parsed && store) {
+    const t0 = performance.now()
+    const nAtoms = store.nAtoms
+    const atomOffset = frameIndex * nAtoms * 3
+    const positions = store.positions.subarray(atomOffset, atomOffset + nAtoms * 3)
+    t.build_display = performance.now() - t0
+  }
+  return t
+}
+
+function collectConfig() {
+  const stages = {}
+  for (const s of STAGES) {
+    const cb = document.getElementById('st_' + s.id)
+    stages[s.id] = cb ? cb.checked : false
+  }
+  return { chunkSize: parseInt($('chunkSize').value, 10), repeats: parseInt($('repeats').value, 10), topology: $('topology').value, liveMode: $('liveMode').value, stages }
+}
+
+function runOnce(opts) {
+  const chunks = ensureChunks()
+  if (!chunks || chunks.length === 0) return null
+  const store = opts.topology === 'fixed' ? makeTrajectoryStore(currentMeta.atomsPerFrame, currentMeta.frameCount) : null
+  const liveNow = isLiveMode() && opts.liveMode !== 'off'
+  const chunkTimes = []
+  for (let ci = 0; ci < chunks.length; ci += 1) {
+    const chunk = chunks[ci]
+    chunkTimes.push(runChunkHandler({ stages: opts.stages, topology: opts.topology, chunk, store, frameIndex: chunk.start + chunk.count - 1, liveNow }))
+  }
+  const summary = {}
+  for (const s of STAGES) summary[s.id] = summarize(chunkTimes.map(c => c[s.id] || 0))
+  const totalChunkSeriesList = chunkTimes.map(c => {
+    let s = 0; for (const stg of STAGES) if (stg.perChunk) s += (c[stg.id] || 0); return s
+  })
+  summary.total = summarize(totalChunkSeriesList)
+  return { stages: opts.stages, chunkTimes, summary, opts, store }
+}
+
+function summarize(arr) {
+  if (!arr || arr.length === 0) return { n: 0, total: 0, avg: 0, first: 0, last: 0, max: 0, min: 0, p95: 0, series: [] }
+  const n = arr.length, total = arr.reduce((a, b) => a + b, 0)
+  const sorted = arr.slice().sort((a, b) => a - b)
+  return {
+    n, total, avg: total / n,
+    first: arr[0], last: arr[n - 1],
+    max: Math.max.apply(null, arr), min: Math.min.apply(null, arr),
+    p95: sorted[Math.min(n - 1, Math.floor(n * 0.95))], series: arr.slice()
+  }
+}
+
+function averagePerIndex(seriesList) {
+  const nonEmpty = seriesList.filter(s => s && s.length)
+  if (nonEmpty.length === 0) return []
+  const minLen = Math.min.apply(null, nonEmpty.map(s => s.length))
+  if (!Number.isFinite(minLen) || minLen <= 0) return []
+  const out = new Array(minLen)
+  for (let k = 0; k < minLen; k += 1) { let sum = 0; for (let i = 0; i < nonEmpty.length; i += 1) sum += nonEmpty[i][k]; out[k] = sum / nonEmpty.length }
+  return out
+}
+
+function runWithRepeats(cfg) {
+  const raws = []
+  for (let i = 0; i < cfg.repeats; i += 1) raws.push(runOnce(cfg))
+  const dropFirst = raws.length >= 2
+  const kept = dropFirst ? raws.slice(1) : raws
+  const perChunkAvg = {}
+  for (const s of STAGES) perChunkAvg[s.id] = averagePerIndex(kept.map(r => r.summary[s.id].series))
+  const totalChunkSeriesList = kept.map(r => r.chunkTimes.map(c => {
+    let s = 0; for (const stg of STAGES) if (stg.perChunk) s += (c[stg.id] || 0); return s
+  }))
+  const totalAvgSeries = averagePerIndex(totalChunkSeriesList)
+  const summary = {}
+  for (const s of STAGES) summary[s.id] = summarize(perChunkAvg[s.id])
+  summary.total = summarize(totalAvgSeries)
+  return { cfg, summary, raws: kept, perChunkSeriesAvg: { total: totalAvgSeries, ...perChunkAvg } }
+}
+
+// ========================== SIM UI hooks ===============================
+btnRun.addEventListener('click', () => {
+  const cfg = collectConfig()
+  if (!currentMeta) { bigTotal.textContent = '—'; bigSub.innerHTML = '<span class="alert bad">⚠ 还没拖文件。</span>'; return }
+  try {
+    const r = ensureChunks()
+    if (!r || r.length === 0) {
+      bigTotal.textContent = '—'
+      bigSub.innerHTML = '<span class="alert bad">⚠ chunks 生成失败</span>'
+      return
+    }
+    const out = runWithRepeats(cfg)
+    lastRun = out
+    recordRun(out, '单次 · ' + (cfg.topology === 'variable' ? 'variable' : 'fixed') + (isLiveMode() && cfg.liveMode !== 'off' ? ' · LIVE' : ' · FALLBACK'))
+    renderSimResults(out)
+    renderFileMeta()
+  } catch (e) {
+    console.error('btnRun failed', e, e && e.stack)
+    bigTotal.textContent = '—'
+    const stack = (e && typeof e.stack === 'string' && e.stack) ? e.stack.split('\n').slice(0, 6).join('\n') : '(no stack)'
+    bigSub.innerHTML = `<span class="alert bad">⚠ 运行失败：${safe(e.message)}<details style="margin-top:6px;"><summary style="cursor:pointer;color:var(--muted);">stacktrace</summary><pre style="background:#fff7ed;padding:8px;border-radius:4px;font-size:12px;line-height:1.4;overflow:auto;max-height:240px;margin:6px 0 0 0;">${safe(stack)}</pre></details></span>`
+  }
+})
+
+btnCompare.addEventListener('click', () => {
+  if (!currentMeta) return
+  const base = collectConfig()
+  ensureChunks()
+  base.stages.write_chunk = base.topology === 'fixed'
+  base.stages.write_var = base.topology === 'variable'
+  const rows = []
+  const enabledNames = STAGES.filter(s => s.perChunk).map(s => s.id)
+  const liveOn = isLiveMode() && base.liveMode !== 'off'
+  for (const s of STAGES) {
+    if (!s.perChunk) continue
+    if (liveOn && (s.id === 'cwb1_magic' || s.id === 'cwb1_header' || s.id === 'cwb1_views')) continue
+    if (!liveOn && s.id === 'cwb1_parse') continue
+    const cfg = { ...base, stages: Object.fromEntries(enabledNames.map(st => [st, st === s.id])) }
+    ensureChunks()
+    const out = runWithRepeats(cfg)
+    rows.push({ stage: s, msPerChunk: out.summary[s.id].avg, total: out.summary[s.id].total })
+  }
+  renderSimCompareResults(rows)
+})
+
+function recordRun(out, tag) {
+  runs.push({ cfg: out.cfg, summary: out.summary, ts: new Date(), tag })
+  runsBody.prepend(makeRunRow(runs.length, tag, out.cfg, out.summary))
+  historyPanel.style.display = ''
+}
+
+function makeRunRow(idx, tag, cfg, summary) {
+  const tr = document.createElement('tr')
+  const mb = currentMeta ? (currentMeta.bytes / (1024 * 1024)) : 0
+  const bytesPerSec = currentMeta ? (mb / (summary.total.last / 1000)).toFixed(2) + ' MB/s' : '—'
+  const theoreticalAtoms = currentMeta ? Math.round((currentMeta.atomsPerFrame * currentMeta.frameCount) / Math.max(1e-9, summary.total.last / 1000)) : 0
+  const topStage = STAGES.filter(s => s.perChunk && cfg.stages[s.id]).sort((a, b) => summary[b.id].avg - summary[a.id].avg)[0]
+  tr.innerHTML = `<tr><td>${idx}</td><td>${safe(tag)}</td><td>${cfg.chunkSize}×${summary.total.n}</td><td class="num"><b>${safe(fmt(summary.total.total))}</b></td><td class="num">${safe(bytesPerSec)}</td><td>${safe(topStage ? topStage.label : '-')}</td><td class="num">${safe(fmt(summary[topStage ? topStage.id : '']?.avg || 0))}</td></tr>`
+  return tr
+}
+
+function renderSimResults(out) {
+  resultsPanel.style.display = ''
+  stacksE2eEl.style.display = 'none'
+  stacksOfflineEl.style.display = ''
+  legendEl.innerHTML = ''
+  $('resultsTitle').textContent = '3. 运行结果（离线模式）'
+  bigTotal.textContent = fmt(out.summary.total.total) + ' ms'
+  const enabledPerChunk = STAGES.filter(s => s.perChunk && out.cfg.stages[s.id]).length
+  bigSub.innerHTML = `${out.summary.total.n} 事件 · chunk=${out.cfg.chunkSize} · ${enabledPerChunk} 个已开阶段`
+  const enabledStages = STAGES.filter(s => s.perChunk && out.cfg.stages[s.id])
+  for (const s of enabledStages) {
+    const span = document.createElement('span')
+    const sw = document.createElement('span'); sw.className = 'swatch'; sw.style.background = s.color
+    span.appendChild(sw); span.appendChild(document.createTextNode(' ' + s.label))
+    legendEl.appendChild(span)
+  }
+  drawSimStacks(out, enabledStages)
+  drawStageTable(out, enabledStages)
+  statLineEl.innerHTML = [
+    '<div class="pill-stat"><span class="muted">avg/chunk</span> <strong>' + fmt(out.summary.total.avg) + '</strong></div>',
+    '<div class="pill-stat"><span class="muted">last</span> <strong>' + fmt(out.summary.total.last) + '</strong></div>',
+    '<div class="pill-stat warn"><span class="muted">max</span> <strong>' + fmt(out.summary.total.max) + '</strong></div>',
+    '<div class="pill-stat"><span class="muted">p95</span> <strong>' + fmt(out.summary.total.p95) + '</strong></div>',
+  ].join('')
+  showHint(out, enabledStages)
+}
+
+function drawSimStacks(out, enabledStages) {
+  const series = out.perChunkSeriesAvg
+  stacksOfflineEl.innerHTML = ''
+  const n = series.total.length
+  if (n === 0) return
+  const target = 220
+  const bucketSize = Math.max(1, Math.ceil(n / target))
+  for (let i = 0; i < n; i += bucketSize) {
+    const col = document.createElement('div')
+    col.style.height = '100%'; col.style.width = '3px'
+    let bucketMax = 0
+    for (let j = i; j < Math.min(n, i + bucketSize); j += 1) {
+      let s = 0; for (const st of enabledStages) s += (series[st.id][j] || 0)
+      if (s > bucketMax) bucketMax = s
+    }
+    for (const st of enabledStages) {
+      const seg = document.createElement('div'); seg.style.background = st.color
+      let segMs = 0
+      for (let j = i; j < Math.min(n, i + bucketSize); j += 1) segMs += (series[st.id][j] || 0)
+      const segHeight = bucketMax > 0 ? (segMs / bucketMax) * 100 : 0
+      seg.style.height = segHeight + '%'; seg.style.width = '100%'
+      seg.setAttribute('data-label', `#${i} 桶\n${st.label}: ${fmt(segMs)} ms`)
+      col.appendChild(seg)
+    }
+    stacksOfflineEl.appendChild(col)
+  }
+}
+
+function drawStageTable(out, enabledStages) {
+  stageTbody.innerHTML = ''
+  const totalAvg = out.summary.total.avg
+  const liveNow = isLiveMode() && out.cfg.liveMode !== 'off'
+  for (const s of enabledStages) {
+    const r = out.summary[s.id]
+    const pct = totalAvg > 0 ? (100 * r.avg / totalAvg) : 0
+    const tr = document.createElement('tr')
+    let impl = '⚪ 页内'
+    if (s.id === 'cwb1_parse' && liveNow && liveModules.structuresMod) impl = '🟢 LIVE'
+    else if (s.liveCaps === 'live' && liveNow) impl = '🟢 LIVE'
+    tr.innerHTML = `<td><span class="swatch" style="background:${safe(s.color)}"></span></td><td>${safe(s.label)}</td><td>${safe(s.group)}</td><td class="num"><b>${fmt(r.avg)}</b></td><td class="num">${fmt(r.total)}</td><td class="num">${pct.toFixed(1)}%</td><td class="num">${fmt(r.max)}</td><td class="num">${fmt(r.min)}</td><td class="num">${fmt(r.last)}</td>`
+    stageTbody.appendChild(tr)
+  }
+}
+
+function showHint(out, enabledStages) {
+  const total = out.summary.total
+  if (enabledStages.length === 0) { hintEl.innerHTML = '<span class="muted">没有开启任何阶段。</span>'; return }
+  const order = enabledStages.slice().sort((a, b) => out.summary[b.id].avg - out.summary[a.id].avg)
+  const top1 = order[0], top2 = order[1]
+  const top1Pct = total.avg > 0 ? (100 * out.summary[top1.id].avg / total.avg) : 0
+  let msg
+  if (top1Pct > 50) msg = `<div class="alert bad">👉 <b>${safe(top1.label)}</b> 主因（${top1Pct.toFixed(0)}%）。</div>`
+  else if (top1Pct > 20) msg = `<div class="alert">⚠ <b>${safe(top1.label)}</b> 显著贡献（${top1Pct.toFixed(0)}%）。</div>`
+  else msg = `<div class="ok">✓ 没有单一阶段主导。</div>`
+  if (top2) msg += `<div class="muted">top2 = ${safe(top2.label)} (${fmt(out.summary[top2.id].avg)} ms/chunk, ${(100 * out.summary[top2.id].avg / Math.max(1, total.avg)).toFixed(0)}%)</div>`
+  hintEl.innerHTML = msg
+}
+
+function renderSimCompareResults(rows) {
+  resultsPanel.style.display = ''
+  $('resultsTitle').textContent = '3. 运行结果（离线模式 · 单阶段 ON-only）'
+  bigTotal.textContent = '—'
+  bigSub.innerHTML = '逐阶段隔离（其它关闭）'
+  let html = '<table class="stages-table"><thead><tr><th></th><th>阶段</th><th class="num">ms/chunk</th></tr></thead><tbody>'
+  for (const r of rows) {
+    html += `<tr><td><span class="swatch" style="background:${safe(r.stage.color)}"></span></td><td>${safe(r.stage.label)}</td><td class="num"><b>${fmt(r.msPerChunk)}</b></td></tr>`
+  }
+  html += '</tbody></table>'
+  hintEl.innerHTML = html
+  stacksOfflineEl.style.display = 'none'
+  stacksE2eEl.style.display = 'none'
+}
+
+btnExport.addEventListener('click', () => {
+  if (!lastRun) return
+  exportPanel.style.display = ''
+  const out = lastRun
+  const exp = { file: currentMeta?.name, bytes: currentMeta?.bytes, nAtoms: currentMeta?.atomsPerFrame, nFrames: currentMeta?.frameCount, chunkSize: out.cfg.chunkSize, repeats: out.cfg.repeats, topology: out.cfg.topology, stages: STAGES.map(s => ({ id: s.id, label: s.label, total: out.summary[s.id].total, avg: out.summary[s.id].avg, max: out.summary[s.id].max })), perChunkSeriesAvg: {} }
+  for (const s of STAGES) exp.perChunkSeriesAvg[s.id] = (out.perChunkSeriesAvg[s.id] || []).map(t => +t.toFixed(3))
+  exportArea.value = JSON.stringify(exp, null, 2)
+  exportArea.select()
+})
+
+btnReload.addEventListener('click', () => { if (currentMeta) handleFile(fileInput.files[0]) })
+btnClear.addEventListener('click', () => {
+  currentBuffer = null; currentText = null; currentLines = null; currentMeta = null; currentChunks = null
+  lastRun = null; runs = []
+  renderFileMeta()
+  stacksOfflineEl.innerHTML = ''; stageTbody.innerHTML = ''
+  resultsPanel.style.display = 'none'; historyPanel.style.display = 'none'; exportPanel.style.display = 'none'
+  btnRun.disabled = true; btnReload.disabled = true; btnClear.disabled = true
+  btnCompare.disabled = true; btnExport.disabled = true
+})
+
+// ========================== E2E Mode =================================
+async function runE2E() {
+  const path = $('e2ePath').value.trim()
+  if (!path) { e2eStatusEl.innerHTML = '<span class="alert bad">⚠ 请填路径</span>'; return }
+  const chunkSize = parseInt($('e2eChunkSize').value, 10) || 32
+  const format = $('e2eFormat').value.trim()
+  const qs = new URLSearchParams({ path, chunk: String(chunkSize), force: 'true' })
+  if (format) qs.set('format', format)
+  const url = '/api/structures/ase/frames.stream?' + qs.toString()
+  e2eStatusEl.innerHTML = '<span class="muted">[connect] ' + safe(url) + '</span>'
+
+  e2eState = {
+    running: true, source: null,
+    t_request: performance.now(),
+    server_ready: null,           // {t_resolve_ms, t_scan_ms, total_frames, server_emit_ms}
+    server_meta: [],              // [{start, count, t_pack_ms, t_b64_ms, server_emit_ms, size_b64}]
+    client_meta_recv: [],         // performance.now() at meta onmessage
+    client_chunk_recv: [],        // performance.now() at chunk onmessage
+    client_first_event: null,
+    store: null,
+    chunkStarts: [],              // for intervals
+  }
+
+  btnE2eRun.disabled = true
+  btnE2eCancel.style.display = ''
+  let es
+  try {
+    es = new EventSource(url)
+  } catch (e) {
+    e2eState = null
+    e2eStatusEl.innerHTML = '<span class="alert bad">⚠ EventSource 初始化失败：' + safe(e?.message || String(e)) + '</span>'
+    btnE2eRun.disabled = false
+    btnE2eCancel.style.display = 'none'
+    return
+  }
+  e2eState.source = es
+
+  let drift = null  // first computed from ready event
+
+  es.addEventListener('ready', (event) => {
+    let data
+    try { data = JSON.parse(event.data) } catch (e) { return }
+    e2eState.server_ready = data
+    const clientRecv = performance.now()
+    if (e2eState.client_first_event == null) e2eState.client_first_event = clientRecv
+    if (drift == null) drift = (clientRecv + EPOCH_OFFSET_AT_LOAD) - data.server_emit_ms
+    e2eState.drift = drift
+    e2eStatusEl.innerHTML = `<span class="muted">[ready]</span> resolve ${fmt(data.t_resolve_ms)} ms · scan ${fmt(data.t_scan_ms)} ms · total_frames ${data.total_frames} · chunk_size ${data.chunk_size} · drift ${drift.toFixed(1)} ms`
+    if (!e2eState.store) e2eState.store = makeTrajectoryStore(0, data.total_frames)
+  })
+
+  es.addEventListener('meta', (event) => {
+    let data
+    try { data = JSON.parse(event.data) } catch (e) { return }
+    e2eState.server_meta.push(data)
+    e2eState.client_meta_recv.push(performance.now())
+  })
+
+  es.addEventListener('chunk', (event) => {
+    const tChunkRecv = performance.now()
+    e2eState.client_chunk_recv.push(tChunkRecv)
+    const b64 = event.data
+    // Front-end parse + write (only this is "frontend")
+    let parsed = null
+    const t_atobStart = performance.now()
+    let binary = ''
+    try { binary = atob(b64) } catch (e) {}
+    const t_atobEnd = performance.now()
+    const bytes = new Uint8Array(binary.length)
+    for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i)
+    const t_loopEnd = performance.now()
+    const buffer = bytes.buffer
+    if (liveModules.structuresMod) {
+      try { parsed = liveModules.structuresMod.parseStructureBinaryChunk(buffer) } catch (e) {}
+    }
+    const t_parseEnd = performance.now()
+
+    if (parsed) {
+      if (!e2eState.store || e2eState.store.nAtoms < parsed.header.n_atoms) {
+        e2eState.store = makeTrajectoryStore(parsed.header.n_atoms, parsed.header.n_frames_total)
+      }
+      writeChunkToStoreLocal(parsed, e2eState.store, false, null)
+    }
+    const t_writeEnd = performance.now()
+
+    // Save timings (relative)
+    if (!e2eState.fe_timings) e2eState.fe_timings = []
+    e2eState.fe_timings.push({
+      atob: t_atobEnd - t_atobStart,
+      loop: t_loopEnd - t_atobEnd,
+      parse: t_parseEnd - t_loopEnd,
+      write: t_writeEnd - t_parseEnd,
+    })
+  })
+
+  es.addEventListener('done', (event) => {
+    es.close()
+    e2eState.running = false
+    const total_ms = performance.now() - e2eState.t_request
+    e2eStatusEl.innerHTML += ` · <span class="ok">[done]</span> ${fmt(total_ms)} ms total`
+    btnE2eRun.disabled = false
+    btnE2eCancel.style.display = 'none'
+    renderE2EResults()
+  })
+
+  es.addEventListener('error', (event) => {
+    console.error('SSE error', event)
+    es.close()
+    e2eState.running = false
+    let msg
+    try {
+      // EventSource doesn't expose data on error; check readyState
+      msg = 'EventSource 异常 (readyState=' + (es.readyState ?? '?') + ')'
+    } catch (e) { msg = String(e) }
+    e2eStatusEl.innerHTML += ' · <span class="alert bad">[error]</span> ' + safe(msg)
+    btnE2eRun.disabled = false
+    btnE2eCancel.style.display = 'none'
+    renderE2EResults()
+  })
+}
+
+btnE2eRun.addEventListener('click', () => { runE2E().catch(e => {
+  console.error('runE2E failed', e)
+  e2eStatusEl.innerHTML = '<span class="alert bad">⚠ ' + safe(e?.message || String(e)) + '</span>'
+  btnE2eRun.disabled = false
+}) })
+
+btnE2eCancel.addEventListener('click', () => {
+  if (e2eState && e2eState.source) { try { e2eState.source.close() } catch (e) {} e2eState.source = null }
+  e2eState && (e2eState.running = false)
+  e2eStatusEl.innerHTML += ' · <span class="alert">[cancelled]</span>'
+  btnE2eRun.disabled = false
+  btnE2eCancel.style.display = 'none'
+})
+
+// ========================== E2E render results =========================
+function renderE2EResults() {
+  if (!e2eState || !e2eState.server_meta || e2eState.server_meta.length === 0) {
+    resultsPanel.style.display = ''
+    bigTotal.textContent = '—'
+    bigSub.innerHTML = '<span class="muted">E2E 没有 chunk meta 抵达</span>'
+    return
+  }
+  const ready = e2eState.server_ready
+  const metas = e2eState.server_meta
+  const metaRecv = e2eState.client_meta_recv
+  const chunksRecv = e2eState.client_chunk_recv
+  const feTimings = e2eState.fe_timings || []
+  const drift = e2eState.drift || 0
+
+  // Build per-chunk record
+  const records = []
+  for (let i = 0; i < metas.length; i += 1) {
+    const m = metas[i]
+    const cr = chunksRecv[i] ?? null
+    const mr = metaRecv[i] ?? null
+    const fe = feTimings[i] || { atob: 0, loop: 0, parse: 0, write: 0 }
+    const profile = m.profile || {}
+    const networkDrift = (cr != null && mr != null) ? (cr - mr) : 0  // meta emit -> chunk onmessage
+    const adjustedServerEmit = (m.server_emit_ms || 0) + drift
+    const mrEpoch = (mr != null) ? (mr + EPOCH_OFFSET_AT_LOAD) : null
+    const serverToMetaClient = (mrEpoch != null) ? (mrEpoch - adjustedServerEmit) : 0
+    const bePack = Number(m.t_pack_ms) || 0
+    const beReadFrameRange = Number(profile.read_frame_range_ms) || 0
+    const beBuildPayloadTotal = Number(profile.build_payload_total_ms) || 0
+    const beNormalizeFrameData = Number(profile.normalize_frame_data_ms) || 0
+    const beNormalizeAtoms = Number(profile.normalize_atoms_ms) || 0
+    const beTopologyCheck = Number(profile.topology_check_ms) || 0
+    const beArrayFill = Number(profile.array_fill_ms) || 0
+    const beAddArrayTobytes = Number(profile.add_array_tobytes_ms) || 0
+    const beHeaderJson = Number(profile.header_json_ms) || 0
+    const bePayloadJoin = Number(profile.payload_join_ms) || 0
+    const beFixedPlainSeek = Number(profile.fixed_plain_xyz_seek_ms) || 0
+    const beFixedPlainHeaderRead = Number(profile.fixed_plain_xyz_header_read_ms) || 0
+    const beFixedPlainAtomReadline = Number(profile.fixed_plain_xyz_atom_readline_ms) || 0
+    const beFixedPlainSplit = Number(profile.fixed_plain_xyz_split_ms) || 0
+    const beFixedPlainSymbolParse = Number(profile.fixed_plain_xyz_symbol_parse_ms) || 0
+    const beFixedPlainCoordJoin = Number(profile.fixed_plain_xyz_coord_join_ms) || 0
+    const beFixedPlainNpFromstring = Number(profile.fixed_plain_xyz_np_fromstring_ms) || 0
+    const beFixedPlainReshape = Number(profile.fixed_plain_xyz_reshape_ms) || 0
+    const beFixedPlainNumbersCopy = Number(profile.fixed_plain_xyz_numbers_copy_ms) || 0
+    const beFixedPlainFrameBuild = Number(profile.fixed_plain_xyz_frame_build_ms) || 0
+    const beBuildAccounted = beNormalizeFrameData + beNormalizeAtoms + beTopologyCheck + beArrayFill + beAddArrayTobytes + beHeaderJson + bePayloadJoin
+    records.push({
+      idx: i,
+      be_pack: bePack,
+      be_b64: Number(m.t_b64_ms) || 0,
+      be_read_frame_range: beReadFrameRange,
+      be_build_payload_total: beBuildPayloadTotal,
+      be_pack_unaccounted: Math.max(0, bePack - beReadFrameRange - beBuildPayloadTotal),
+      be_normalize_frame_data: beNormalizeFrameData,
+      be_normalize_atoms: beNormalizeAtoms,
+      be_topology_check: beTopologyCheck,
+      be_array_fill: beArrayFill,
+      be_add_array_tobytes: beAddArrayTobytes,
+      be_header_json: beHeaderJson,
+      be_payload_join: bePayloadJoin,
+      be_build_unaccounted: Math.max(0, beBuildPayloadTotal - beBuildAccounted),
+      be_fixed_plain_seek: beFixedPlainSeek,
+      be_fixed_plain_header_read: beFixedPlainHeaderRead,
+      be_fixed_plain_atom_readline: beFixedPlainAtomReadline,
+      be_fixed_plain_split: beFixedPlainSplit,
+      be_fixed_plain_symbol_parse: beFixedPlainSymbolParse,
+      be_fixed_plain_coord_join: beFixedPlainCoordJoin,
+      be_fixed_plain_np_fromstring: beFixedPlainNpFromstring,
+      be_fixed_plain_reshape: beFixedPlainReshape,
+      be_fixed_plain_numbers_copy: beFixedPlainNumbersCopy,
+      be_fixed_plain_frame_build: beFixedPlainFrameBuild,
+      be_fixed_plain_path: profile.fixed_plain_xyz_path || '',
+      be_payload_bytes: Number(profile.payload_bytes) || 0,
+      be_safe_count: Number(profile.safe_count) || 0,
+      be_read_path: profile.read_path || '',
+      be_topology_kind: profile.topology || '',
+      networkDrift,
+      metaToChunk: (cr != null && mr != null) ? (cr - mr) : 0,
+      serverToMetaClient,
+      fe_atob: fe.atob || 0,
+      fe_b64_to_bytes_loop: fe.loop || 0,
+      fe_parse: fe.parse || 0,
+      fe_write: fe.write || 0,
+      size_b64: m.size_b64 || 0,
+    })
+  }
+
+  // Big total
+  const totalBackend = (ready?.t_resolve_ms || 0) + (ready?.t_scan_ms || 0)
+    + records.reduce((a, r) => a + r.be_pack + r.be_b64, 0)
+  const totalNetwork = records.reduce((a, r) => a + r.serverToMetaClient, 0)
+  const totalFrontend = records.reduce((a, r) => a + r.fe_atob + r.fe_b64_to_bytes_loop + r.fe_parse + r.fe_write, 0)
+  const wall = performance.now() - e2eState.t_request
+
+  resultsPanel.style.display = ''
+  stacksOfflineEl.style.display = 'none'
+  stacksE2eEl.style.display = ''
+  $('resultsTitle').textContent = '3. 运行结果（E2E 全链路）'
+  bigTotal.textContent = fmt(wall) + ' ms'
+  bigSub.innerHTML = `${records.length} chunks · drift ${drift.toFixed(1)} ms · backend ${fmt(totalBackend)} ms · network ${fmt(totalNetwork)} ms · frontend ${fmt(totalFrontend)} ms`
+
+  // Legend
+  legendEl.innerHTML = ''
+  const legendItems = [
+    { color: '#b91c1c', label: '后端 compute (resolve/scan/pack/b64)' },
+    { color: '#7c3aed', label: '网络/IO (meta→chunk onmessage)' },
+    { color: '#2563eb', label: '前端 解析 (atob + 1-char + parse)' },
+    { color: '#0891b2', label: '前端 存储 (writeChunkToStore)' },
+  ]
+  for (const li of legendItems) {
+    const span = document.createElement('span')
+    const sw = document.createElement('span'); sw.className = 'swatch'; sw.style.background = li.color
+    span.appendChild(sw); span.appendChild(document.createTextNode(' ' + li.label))
+    legendEl.appendChild(span)
+  }
+
+  // Stacked bars
+  drawE2EStacks(records)
+
+  // Per-stage table
+  drawE2EStageTable(records, ready, drift)
+
+  // Stats
+  function stat(arr) {
+    if (!arr.length) return { avg: 0, total: 0, max: 0, p95: 0 }
+    const sorted = arr.slice().sort((a, b) => a - b)
+    return {
+      avg: arr.reduce((a, b) => a + b, 0) / arr.length,
+      total: arr.reduce((a, b) => a + b, 0),
+      max: Math.max.apply(null, arr),
+      p95: sorted[Math.min(arr.length - 1, Math.floor(arr.length * 0.95))],
+    }
+  }
+  const be_pack_s = stat(records.map(r => r.be_pack))
+  const be_b64_s = stat(records.map(r => r.be_b64))
+  const be_read_s = stat(records.map(r => r.be_read_frame_range))
+  const be_build_s = stat(records.map(r => r.be_build_payload_total))
+  const be_fill_s = stat(records.map(r => r.be_array_fill))
+  const be_tobytes_s = stat(records.map(r => r.be_add_array_tobytes))
+  const be_payload_bytes_s = stat(records.map(r => r.be_payload_bytes))
+  const net_s = stat(records.map(r => r.networkDrift))
+  const fe_atob_s = stat(records.map(r => r.fe_atob))
+  const fe_loop_s = stat(records.map(r => r.fe_b64_to_bytes_loop))
+  const fe_parse_s = stat(records.map(r => r.fe_parse))
+  const fe_write_s = stat(records.map(r => r.fe_write))
+  function uniqueSummary(values) {
+    const unique = Array.from(new Set(values.filter(Boolean)))
+    if (!unique.length) return '—'
+    return unique.slice(0, 3).join(', ') + (unique.length > 3 ? ` +${unique.length - 3}` : '')
+  }
+
+  statLineEl.innerHTML = [
+    '<div class="pill-stat"><span class="muted">wall</span> <strong>' + fmt(wall) + '</strong></div>',
+    '<div class="pill-stat"><span class="muted">backend 总</span> <strong>' + fmt(totalBackend) + '</strong></div>',
+    '<div class="pill-stat"><span class="muted">network 总</span> <strong>' + fmt(totalNetwork) + '</strong></div>',
+    '<div class="pill-stat"><span class="muted">frontend 总</span> <strong>' + fmt(totalFrontend) + '</strong></div>',
+    '<div class="pill-stat warn"><span class="muted">pack μ</span> <strong>' + fmt(be_pack_s.avg) + '</strong></div>',
+    '<div class="pill-stat warn"><span class="muted">read μ</span> <strong>' + fmt(be_read_s.avg) + '</strong></div>',
+    '<div class="pill-stat warn"><span class="muted">build μ</span> <strong>' + fmt(be_build_s.avg) + '</strong></div>',
+    '<div class="pill-stat warn"><span class="muted">fill μ</span> <strong>' + fmt(be_fill_s.avg) + '</strong></div>',
+    '<div class="pill-stat warn"><span class="muted">tobytes μ</span> <strong>' + fmt(be_tobytes_s.avg) + '</strong></div>',
+    '<div class="pill-stat warn"><span class="muted">b64 μ</span> <strong>' + fmt(be_b64_s.avg) + '</strong></div>',
+    '<div class="pill-stat"><span class="muted">read path</span> <strong>' + safe(uniqueSummary(records.map(r => r.be_read_path))) + '</strong></div>',
+    '<div class="pill-stat"><span class="muted">topology</span> <strong>' + safe(uniqueSummary(records.map(r => r.be_topology_kind))) + '</strong></div>',
+    '<div class="pill-stat"><span class="muted">payload μ</span> <strong>' + fmt(be_payload_bytes_s.avg / 1024 / 1024) + ' MiB</strong></div>',
+  ].join('')
+
+  // Top-1 hint
+  const sum_total = totalBackend + totalNetwork + totalFrontend
+  const parts = [
+    { name: '后端 compute', color: '#b91c1c', ms: totalBackend },
+    { name: '网络 drift', color: '#7c3aed', ms: totalNetwork },
+    { name: '前端 解析+存储', color: '#2563eb', ms: totalFrontend },
+  ].sort((a, b) => b.ms - a.ms)
+  const top = parts[0]
+  const topPct = sum_total > 0 ? (top.ms / sum_total * 100) : 0
+  let hint
+  if (topPct > 50) hint = `<div class="alert bad">👉 <b>${safe(top.name)}</b> 主因（${topPct.toFixed(0)}% / ${fmt(top.ms)} ms）。</div>`
+  else if (topPct > 25) hint = `<div class="alert">⚠ <b>${safe(top.name)}</b> 显著贡献（${topPct.toFixed(0)}%）。</div>`
+  else hint = `<div class="ok">✓ 4 个维度分布均匀；瓶颈不单一。</div>`
+  hint += `<div class="muted">组成: backend=${fmt(totalBackend)} (${(totalBackend / sum_total * 100).toFixed(0)}%) · network=${fmt(totalNetwork)} (${(totalNetwork / sum_total * 100).toFixed(0)}%) · frontend=${fmt(totalFrontend)} (${(totalFrontend / sum_total * 100).toFixed(0)}%)</div>`
+  hintEl.innerHTML = hint
+}
+
+function drawE2EStacks(records) {
+  const series = records.map(r => ({
+    backend: r.be_pack + r.be_b64,
+    network: r.networkDrift,
+    feparse: r.fe_atob + r.fe_b64_to_bytes_loop + r.fe_parse,
+    festore: r.fe_write,
+  }))
+  const totalArr = series.map(s => s.backend + s.network + s.feparse + s.festore).concat([1e-9])
+  const maxTotal = Math.max.apply(null, totalArr)
+  stacksE2eEl.innerHTML = ''
+  const n = records.length
+  if (n === 0) return
+  const target = 220
+  const bucketSize = Math.max(1, Math.ceil(n / target))
+  const colors = { backend: '#b91c1c', network: '#7c3aed', feparse: '#2563eb', festore: '#0891b2' }
+  for (let i = 0; i < n; i += bucketSize) {
+    const col = document.createElement('div')
+    col.style.height = '100%'; col.style.width = '3px'
+    let bucketMax = 0
+    for (let j = i; j < Math.min(n, i + bucketSize); j += 1) {
+      const ts = series[j]
+      const sum = ts.backend + ts.network + ts.feparse + ts.festore
+      if (sum > bucketMax) bucketMax = sum
+    }
+    for (const k of GROUP_ORDER) {
+      if (k === 'render') continue
+      if (k === 'feparse') {
+        const seg = document.createElement('div'); seg.style.background = colors.feparse
+        let segMs = 0
+        for (let j = i; j < Math.min(n, i + bucketSize); j += 1) segMs += series[j].feparse
+        const segHeight = bucketMax > 0 ? (segMs / bucketMax) * 100 : 0
+        seg.style.height = segHeight + '%'; seg.style.width = '100%'
+        seg.setAttribute('data-label', '#' + i + ' feparse: ' + fmt(segMs) + ' ms')
+        col.appendChild(seg)
+      } else if (k === 'festore') {
+        const seg = document.createElement('div'); seg.style.background = colors.festore
+        let segMs = 0
+        for (let j = i; j < Math.min(n, i + bucketSize); j += 1) segMs += series[j].festore
+        const segHeight = bucketMax > 0 ? (segMs / bucketMax) * 100 : 0
+        seg.style.height = segHeight + '%'; seg.style.width = '100%'
+        seg.setAttribute('data-label', '#' + i + ' festore: ' + fmt(segMs) + ' ms')
+        col.appendChild(seg)
+      } else if (k === 'backend') {
+        const seg = document.createElement('div'); seg.style.background = colors.backend
+        let segMs = 0
+        for (let j = i; j < Math.min(n, i + bucketSize); j += 1) segMs += series[j].backend
+        const segHeight = bucketMax > 0 ? (segMs / bucketMax) * 100 : 0
+        seg.style.height = segHeight + '%'; seg.style.width = '100%'
+        seg.setAttribute('data-label', '#' + i + ' backend: ' + fmt(segMs) + ' ms')
+        col.appendChild(seg)
+      } else if (k === 'network') {
+        const seg = document.createElement('div'); seg.style.background = colors.network
+        let segMs = 0
+        for (let j = i; j < Math.min(n, i + bucketSize); j += 1) segMs += series[j].network
+        const segHeight = bucketMax > 0 ? (segMs / bucketMax) * 100 : 0
+        seg.style.height = segHeight + '%'; seg.style.width = '100%'
+        seg.setAttribute('data-label', '#' + i + ' network: ' + fmt(segMs) + ' ms')
+        col.appendChild(seg)
+      }
+    }
+    stacksE2eEl.appendChild(col)
+  }
+}
+
+function drawE2EStageTable(records, ready, drift) {
+  stageTbody.innerHTML = ''
+  function stat(arr) {
+    if (!arr.length) return { avg: 0, total: 0, max: 0, min: 0 }
+    return {
+      avg: arr.reduce((a, b) => a + b, 0) / arr.length,
+      total: arr.reduce((a, b) => a + b, 0),
+      max: Math.max.apply(null, arr),
+      min: Math.min.apply(null, arr),
+    }
+  }
+  function uniqueSummary(values) {
+    const unique = Array.from(new Set(values.filter(Boolean)))
+    if (!unique.length) return '—'
+    return unique.slice(0, 3).join(', ') + (unique.length > 3 ? ` +${unique.length - 3}` : '')
+  }
+  const rows = []
+  if (ready) {
+    rows.push({ color: '#b91c1c', label: 'Backend · resolve (一次)', group: 'backend', r: { avg: ready.t_resolve_ms, total: ready.t_resolve_ms, max: ready.t_resolve_ms, min: ready.t_resolve_ms, pct: 0 }, note: 'ready' })
+    rows.push({ color: '#b91c1c', label: 'Backend · scan (一次)', group: 'backend', r: { avg: ready.t_scan_ms, total: ready.t_scan_ms, max: ready.t_scan_ms, min: ready.t_scan_ms, pct: 0 }, note: 'ready' })
+  }
+  const total = records.reduce((a, r) => a + r.be_pack + r.be_b64 + r.networkDrift + r.fe_atob + r.fe_b64_to_bytes_loop + r.fe_parse + r.fe_write, 0)
+  function push(label, group, color, field, note) {
+    const s = stat(records.map(r => Number(r[field]) || 0))
+    const pct = total > 0 ? (s.total / total * 100) : 0
+    rows.push({ color, label, group, r: { avg: s.avg, total: s.total, max: s.max, min: s.min, pct }, note })
+  }
+  const readPaths = uniqueSummary(records.map(r => r.be_read_path))
+  const topologies = uniqueSummary(records.map(r => r.be_topology_kind))
+  const fixedPlainPaths = uniqueSummary(records.map(r => r.be_fixed_plain_path))
+  push('Backend · t_pack total', 'backend', '#b91c1c', 'be_pack', 'stream_frame_chunk_binary wall')
+  push('Backend detail · read_frame_range', 'backend/read', '#ef4444', 'be_read_frame_range', readPaths)
+  push('Backend read detail · fixed xyz seek', 'backend/read', '#f87171', 'be_fixed_plain_seek', fixedPlainPaths)
+  push('Backend read detail · fixed xyz header readline', 'backend/read', '#fb7185', 'be_fixed_plain_header_read', fixedPlainPaths)
+  push('Backend read detail · fixed xyz atom readline', 'backend/read', '#e11d48', 'be_fixed_plain_atom_readline', fixedPlainPaths)
+  push('Backend read detail · fixed xyz split(maxsplit=1)', 'backend/read', '#be123c', 'be_fixed_plain_split', fixedPlainPaths)
+  push('Backend read detail · fixed xyz symbol parse', 'backend/read', '#9f1239', 'be_fixed_plain_symbol_parse', 'first chunk frame defines numbers')
+  push('Backend read detail · fixed xyz coord join', 'backend/read', '#f43f5e', 'be_fixed_plain_coord_join', fixedPlainPaths)
+  push('Backend read detail · fixed xyz np.fromstring', 'backend/read', '#ec4899', 'be_fixed_plain_np_fromstring', fixedPlainPaths)
+  push('Backend read detail · fixed xyz reshape', 'backend/read', '#db2777', 'be_fixed_plain_reshape', fixedPlainPaths)
+  push('Backend read detail · fixed xyz numbers copy', 'backend/read', '#a21caf', 'be_fixed_plain_numbers_copy', fixedPlainPaths)
+  push('Backend read detail · fixed xyz frame build', 'backend/read', '#9333ea', 'be_fixed_plain_frame_build', fixedPlainPaths)
+  push('Backend detail · build_payload total', 'backend/build', '#f97316', 'be_build_payload_total', topologies)
+  push('Backend detail · pack unaccounted', 'backend/other', '#fb923c', 'be_pack_unaccounted', 't_pack - read - build')
+  push('Backend detail · normalize FrameData', 'backend/build', '#ea580c', 'be_normalize_frame_data', 'fast parsers')
+  push('Backend detail · normalize Atoms', 'backend/build', '#c2410c', 'be_normalize_atoms', 'ASE Atoms path')
+  push('Backend detail · topology check', 'backend/build', '#a16207', 'be_topology_check', topologies)
+  push('Backend detail · array fill', 'backend/build', '#ca8a04', 'be_array_fill')
+  push('Backend detail · add_array tobytes', 'backend/build', '#854d0e', 'be_add_array_tobytes')
+  push('Backend detail · header JSON', 'backend/build', '#b45309', 'be_header_json')
+  push('Backend detail · payload join', 'backend/build', '#d97706', 'be_payload_join')
+  push('Backend detail · build unaccounted', 'backend/build', '#f59e0b', 'be_build_unaccounted', 'build - known substeps')
+  push('Backend · t_b64 (base64.b64encode)', 'backend', '#dc2626', 'be_b64')
+  push('Network · drift (meta→chunk onmessage)', 'network', '#7c3aed', 'networkDrift')
+  push('Browser · atob (chunk payload)', 'feparse', '#2563eb', 'fe_atob')
+  push('Browser · 1-字符 charCodeAt 循环', 'feparse', '#1d4ed8', 'fe_b64_to_bytes_loop')
+  push('Browser · parseStructureBinaryChunk (LIVE)', 'feparse', '#0e7490', 'fe_parse')
+  push('Browser · writeChunkToStore (TypedArray.set)', 'festore', '#0891b2', 'fe_write')
+
+  for (const row of rows) {
+    const tr = document.createElement('tr')
+    tr.innerHTML = `<td><span class="swatch" style="background:${safe(row.color)}"></span></td><td>${safe(row.label)}</td><td>${safe(row.group)}</td><td class="num"><b>${fmt(row.r.avg)}</b></td><td class="num">${fmt(row.r.total)}</td><td class="num">${row.r.pct.toFixed(1)}%</td><td class="num">${fmt(row.r.max)}</td><td class="num">${fmt(row.r.min)}</td><td class="num">${safe(row.note || '—')}</td>`
+    stageTbody.appendChild(tr)
+  }
+}
+</script>
+</body>
+</html>

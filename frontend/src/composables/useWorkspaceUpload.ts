@@ -1,5 +1,6 @@
 import { computed, ref } from 'vue'
 import { ElMessage } from 'element-plus'
+import { useSystemStore } from '../stores/system'
 import { uploadFile, type UploadProgress } from '../api/files'
 import {
   filesToUploadEntries,
@@ -8,6 +9,7 @@ import {
   type UploadConflictResolution,
   type UploadEntry
 } from '../api/uploadEntries'
+import { confirmOversizedUpload } from '../api/uploadSizeCheck'
 import { t } from '../i18n'
 
 type UploadState = {
@@ -45,6 +47,7 @@ export function useWorkspaceUpload(
   currentPath: { value: string },
   onUploadComplete: () => void | Promise<void>
 ) {
+  const systemStore = useSystemStore()
   const uploadState = ref<UploadState>({
     active: false,
     currentFile: '',
@@ -95,6 +98,11 @@ export function useWorkspaceUpload(
         cancelled: preparedResult.cancelled,
         message: preparedResult.invalidCount > 0 ? t('message.uploadInvalidPath', { count: preparedResult.invalidCount }) : ''
       }
+    }
+
+    const sizeCheck = await confirmOversizedUpload(systemStore.systemInfo, prepared)
+    if (!sizeCheck) {
+      return { uploaded: 0, failed: prepared.length, total: entries.length, cancelled: true, message: t('terminal.transferCancelled') }
     }
 
     let uploaded = 0

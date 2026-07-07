@@ -59,6 +59,15 @@ class TerminalTransferRequest:
 
 
 @dataclass
+class TerminalCommandDone:
+    seq: int
+    cwd: str
+
+    def to_message(self) -> dict[str, Any]:
+        return {"type": "command_done", "seq": self.seq, "path": self.cwd}
+
+
+@dataclass
 class TerminalSession:
     session_id: str
     client_id: str
@@ -70,6 +79,10 @@ class TerminalSession:
     allow_sync_cwd: bool
     clients: int = 0
     _pending_cwd: str | None = field(default=None, init=False, repr=False)
+    _pending_command_done: list[TerminalCommandDone] = field(default_factory=list, init=False, repr=False)
+    _command_done_seq: int = field(default=0, init=False, repr=False)
+    _entered_command_count: int = field(default=0, init=False, repr=False)
+    _shell_prompt_ready: bool = field(default=True, init=False, repr=False)
     _control_marker_buffer: str = field(default="", init=False, repr=False)
     _zmodem_signature_buffer: str = field(default="", init=False, repr=False)
     _native_zmodem_intercepted: bool = field(default=False, init=False, repr=False)
@@ -88,6 +101,7 @@ class TerminalSession:
         return self._extract_control_markers("")
 
     def write(self, data: str) -> None:
+        self._note_user_input(data)
         self.provider.write(data)
         self.touch()
 
@@ -111,6 +125,11 @@ class TerminalSession:
         cwd = self._pending_cwd
         self._pending_cwd = None
         return cwd
+
+    def consume_command_done(self) -> list[TerminalCommandDone]:
+        events = self._pending_command_done
+        self._pending_command_done = []
+        return events
 
     def consume_transfer_requests(self) -> list[TerminalTransferRequest]:
         transfers = self._pending_transfers
@@ -171,11 +190,29 @@ class TerminalSession:
         if not path.exists() or not path.is_dir():
             return
         normalized = str(path)
-        if normalized == self.cwd:
+        if self._entered_command_count > 0:
+            self._entered_command_count -= 1
+            self._command_done_seq += 1
+            self._pending_command_done.append(TerminalCommandDone(seq=self._command_done_seq, cwd=normalized))
+            self.touch()
+        self._shell_prompt_ready = True
+        if normalized != self.cwd:
+            self.cwd = normalized
+            self._pending_cwd = normalized
+            self.touch()
+
+    def _note_user_input(self, data: str) -> None:
+        if not data or not self._shell_prompt_ready:
             return
-        self.cwd = normalized
-        self._pending_cwd = normalized
-        self.touch()
+        line_feeds_without_carriage_return = sum(
+            1
+            for index, char in enumerate(data)
+            if char == "\n" and (index == 0 or data[index - 1] != "\r")
+        )
+        command_count = data.count("\r") + line_feeds_without_carriage_return
+        if command_count > 0:
+            self._entered_command_count += command_count
+            self._shell_prompt_ready = False
 
     def _accept_transfer_marker(self, encoded_payload: str) -> None:
         try:

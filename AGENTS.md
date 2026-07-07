@@ -86,3 +86,4 @@ If sandboxed `npm` fails on Windows, rerun the same command with approval outsid
 - Prefer existing backend services/providers instead of putting business logic in routers.
 - Large file previews should ask for confirmation before using `force=true`.
 - Do not start a dev server unless the user explicitly needs to try the running UI.
+- Do not operate on `git` unless the user explicitly asks for it.

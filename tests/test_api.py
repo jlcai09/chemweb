@@ -151,6 +151,25 @@ def test_brotli_respects_zero_quality(tmp_path: Path) -> None:
     assert "content-encoding" not in response.headers
 
 
+def test_brotli_stream_compresses_event_streams(tmp_path: Path) -> None:
+    client = make_client_with_compression(tmp_path)
+    sample = tmp_path / "sample.xyz"
+    sample.write_text("1\nframe 0\nH 0 0 0\n1\nframe 1\nH 0 0 1\n", encoding="utf-8")
+
+    response = client.get(
+        "/api/structures/ase/frames.stream",
+        params={"path": str(sample), "chunk": 1},
+        headers={"Accept-Encoding": "br"},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert response.headers["content-encoding"] == "br"
+    assert "content-length" not in response.headers
+    assert "accept-encoding" in response.headers["vary"].lower()
+    assert "event: chunk" in response.text
+
+
 def test_plugins_can_be_listed_activated_and_served(tmp_path: Path) -> None:
     client = make_client(tmp_path)
     sample = tmp_path / "sample.log"
@@ -239,6 +258,25 @@ def test_plugin_get_routes_take_precedence_over_spa_fallback(tmp_path: Path) -> 
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("application/json")
     assert response.json() == {"ok": True}
+
+    deactivated = client.post("/api/plugins/dummy-get/deactivate")
+    assert deactivated.status_code == 200
+    assert deactivated.json()["active"] is False
+
+    removed = client.get("/api/plugins/dummy-get/api/hello")
+    assert not (
+        removed.status_code == 200
+        and removed.headers.get("content-type", "").startswith("application/json")
+        and removed.json() == {"ok": True}
+    )
+
+    reactivated = client.post("/api/plugins/dummy-get/activate")
+    assert reactivated.status_code == 200
+
+    restored = client.get("/api/plugins/dummy-get/api/hello")
+    assert restored.status_code == 200
+    assert restored.headers["content-type"].startswith("application/json")
+    assert restored.json() == {"ok": True}
 
     route_paths = [getattr(route, "path", None) for route in client.app.router.routes]
     if "/{full_path:path}" in route_paths:
@@ -694,6 +732,7 @@ def test_slurm_queue_can_list_all_or_current_user(tmp_path: Path, monkeypatch) -
                     "user_name": "bob",
                     "job_state": "RUNNING",
                     "partition": "debug",
+                    "time": {"elapsed": 12},
                     "working_directory": str(tmp_path),
                 }
             ]

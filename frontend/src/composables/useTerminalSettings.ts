@@ -4,6 +4,7 @@ import { getClientPreferences, saveClientPreferencesPatch } from '../api/clientP
 const TERMINAL_FONT_SIZE_STORAGE_KEY = 'chemssh.terminal.fontSize'
 const TERMINAL_VIM_COMPATIBILITY_STORAGE_KEY = 'chemssh.terminal.vimCompatibility'
 const TERMINAL_AUTO_COPY_SELECTION_STORAGE_KEY = 'chemssh.terminal.autoCopySelection'
+const TERMINAL_REFRESH_FILE_MANAGER_AFTER_COMMAND_STORAGE_KEY = 'chemssh.terminal.refreshFileManagerAfterCommand'
 const DEFAULT_TERMINAL_FONT_SIZE = 13
 const TERMINAL_FONT_SIZE_MIN = 10
 const TERMINAL_FONT_SIZE_MAX = 24
@@ -17,6 +18,7 @@ export function useTerminalSettings() {
   const terminalFontSize = ref(readStoredTerminalFontSize())
   const vimCompatibilityMode = ref(readStoredVimCompatibilityMode())
   const autoCopySelection = ref(readStoredAutoCopySelection())
+  const refreshFileManagerAfterCommand = ref(readStoredRefreshFileManagerAfterCommand())
 
   function setTerminalFontSize(value: number | undefined) {
     if (typeof value !== 'number' || !Number.isFinite(value)) return
@@ -77,15 +79,37 @@ export function useTerminalSettings() {
     void saveClientPreferencesPatch({ terminal: { autoCopySelection: value } })
   }
 
+  function readStoredRefreshFileManagerAfterCommand() {
+    const prefs = getClientPreferences().terminal?.refreshFileManagerAfterCommand
+    if (typeof prefs === 'boolean') return prefs
+    if (typeof window === 'undefined') return true
+    try {
+      const stored = window.localStorage.getItem(TERMINAL_REFRESH_FILE_MANAGER_AFTER_COMMAND_STORAGE_KEY)
+      return stored === null ? true : stored !== 'false'
+    } catch {
+      return true
+    }
+  }
+
+  function storeRefreshFileManagerAfterCommand(value: boolean) {
+    try {
+      window.localStorage.setItem(TERMINAL_REFRESH_FILE_MANAGER_AFTER_COMMAND_STORAGE_KEY, String(value))
+    } catch {
+    }
+    void saveClientPreferencesPatch({ terminal: { refreshFileManagerAfterCommand: value } })
+  }
+
   return {
     TERMINAL_FONT_SIZE_MIN,
     TERMINAL_FONT_SIZE_MAX,
     terminalFontSize,
     vimCompatibilityMode,
     autoCopySelection,
+    refreshFileManagerAfterCommand,
     setTerminalFontSize,
     storeTerminalFontSize,
     storeVimCompatibilityMode,
-    storeAutoCopySelection
+    storeAutoCopySelection,
+    storeRefreshFileManagerAfterCommand
   }
 }

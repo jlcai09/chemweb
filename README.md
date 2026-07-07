@@ -109,7 +109,7 @@ viewer:
     prefer_binary: true
     max_atoms: 200000
     max_frames: 5000
-    binary_chunk_frames: 64
+    binary_chunk_frames: 32
 
 terminal:
   enabled: true
@@ -153,6 +153,8 @@ chmod +x create-release-archive.sh
 On Windows, use Git Bash to run the `.sh` script. It is the supported release packaging entry point and generates both `.tar.gz` and `.zip` formats.
 
 This will build the frontend and create `release/chemssh-{VERSION}/`, `.tar.gz`, and `.zip` with checksums. The release package includes pre-built `frontend/dist/` (no Node.js required for users).
+
+For offline PyInstaller runtime packaging with replaceable plain-text backend code, see [packaging/pyinstaller-external-backend.md](packaging/pyinstaller-external-backend.md).
 
 See [docs/RELEASE.md](docs/RELEASE.md) for detailed release procedures.
 

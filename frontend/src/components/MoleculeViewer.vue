@@ -50,8 +50,10 @@
           <template #dropdown>
             <el-dropdown-menu>
               <el-dropdown-item command="original">{{ t('viewer.exportOriginal') }}</el-dropdown-item>
-              <el-dropdown-item command="xyz">{{ t('viewer.exportXYZ') }}</el-dropdown-item>
-              <el-dropdown-item command="arc">{{ t('viewer.exportArc') }}</el-dropdown-item>
+              <el-dropdown-item command="current-xyz">{{ t('viewer.exportCurrentXYZ') }}</el-dropdown-item>
+              <el-dropdown-item command="current-xsd">{{ t('viewer.exportCurrentXSD') }}</el-dropdown-item>
+              <el-dropdown-item v-if="asePreview?.is_trajectory" command="trajectory-xyz" divided>{{ t('viewer.exportTrajectoryXYZ') }}</el-dropdown-item>
+              <el-dropdown-item v-if="asePreview?.is_trajectory" command="trajectory-arc">{{ t('viewer.exportTrajectoryArc') }}</el-dropdown-item>
               <el-dropdown-item command="screenshot">{{ t('viewer.exportScreenshot') }}</el-dropdown-item>
             </el-dropdown-menu>
           </template>
@@ -285,12 +287,12 @@
 <script setup lang="ts">
 import { computed, defineComponent, h, nextTick, onBeforeUnmount, onMounted, ref, watch, watchEffect } from 'vue'
 import { CaretBottom, CaretTop, Close, Connection, Crop, Download, Grid, Refresh, View, WarningFilled } from '@element-plus/icons-vue'
-import { readStructureFrame, readStructureFrameChunk, readStructureFrameJsonChunk } from '../api/structures'
+import { frameFromStructureChunk, readStructureFrame, readStructureFrameChunk, readStructureFrameJsonChunk, streamStructureFrames } from '../api/structures'
 import { downloadUrl } from '../api/http'
 import { t } from '../i18n'
 import type { AseFrame, AseFrameChunk, AsePreviewResponse } from '../types/structure'
 import type { AtomIndexBase, StructureFrame, TrajectoryStore, ViewerStyleMode } from '../viewer'
-import { exportToXYZ, exportTrajectoryToXYZ, exportTrajectoryToArc, downloadTextFile, getBaseFilename } from '../utils/structureExport'
+import { exportToXYZ, exportToXSD, exportTrajectoryToXYZ, exportTrajectoryToArc, downloadTextFile, getBaseFilename } from '../utils/structureExport'
 
 type StyleMode = ViewerStyleMode
 type ViewerModule = typeof import('../viewer')
@@ -393,18 +395,23 @@ let renderVersion = 0
 let scheduledFrame: number | null = null
 let frameRequestHandle = 0
 let frameLoadVersion = 0
+let frameLoadingVersion = 0
+let frameLoadingTimer: number | null = null
 let preloadVersion = 0
 let trajectoryStore: TrajectoryStore | null = null
 let viewerModulePromise: Promise<ViewerModule> | null = null
+let activeEventSource: EventSource | null = null
 
 const jsonFrameCache = new Map<number, AseFrame>()
+const variableBinaryFrameCache = new Map<number, AseFrame>()
 const pendingChunks = new Map<number, PendingFrameChunkRequest>()
+const pendingVariableChunks = new Map<number, PendingFrameChunkRequest>()
 const pendingJsonChunks = new Map<number, PendingFrameChunkRequest>()
-const chunkSize = 64
-const jsonChunkSize = 16
+const chunkSize = 32
+const streamChunkSize = 32
+const jsonChunkSize = 32
 const jsonWarmChunkRadius = 1
-const maxLocalTrajectoryBytes = 512 * 1024 * 1024
-const maxLocalJsonTrajectoryBytes = 256 * 1024 * 1024
+const frameLoadingDelayMs = 120
 const maxSupercellAxis = 10
 const metricChartWidth = 132
 const metricChartHeight = 44
@@ -624,11 +631,17 @@ function handleExportCommand(command: string) {
     case 'original':
       exportOriginal()
       break
-    case 'xyz':
-      exportXYZ()
+    case 'current-xyz':
+      exportCurrentXYZ()
       break
-    case 'arc':
-      exportArc()
+    case 'current-xsd':
+      exportCurrentXSD()
+      break
+    case 'trajectory-xyz':
+      exportTrajectoryXYZ()
+      break
+    case 'trajectory-arc':
+      exportTrajectoryArc()
       break
     case 'screenshot':
       exportPng()
@@ -648,51 +661,57 @@ function exportOriginal() {
   document.body.removeChild(link)
 }
 
-async function exportXYZ() {
+function exportCurrentXYZ() {
   if (!props.asePreview) return
   try {
     const basename = getBaseFilename(props.asePreview.path)
-    const filename = `${basename}.xyz`
-
-    // For trajectories, export all frames
-    if (props.asePreview.is_trajectory) {
-      const frames = await loadAllFrames()
-      if (frames.length === 0) return
-      const content = exportTrajectoryToXYZ(frames, basename)
-      downloadTextFile(content, filename, 'chemical/x-xyz')
-    } else {
-      // For single structure, export current frame
-      const frame = getCurrentFrame()
-      if (!frame) return
-      const content = exportToXYZ(frame, basename)
-      downloadTextFile(content, filename, 'chemical/x-xyz')
-    }
+    const frame = getCurrentFrame()
+    if (!frame) return
+    const suffix = props.asePreview.is_trajectory ? `-frame-${frame.frame_index}` : ''
+    const content = exportToXYZ(frame, basename)
+    downloadTextFile(content, `${basename}${suffix}.xyz`, 'chemical/x-xyz')
   } catch (error) {
-    console.error('Failed to export XYZ:', error)
+    console.error('Failed to export current XYZ:', error)
   }
 }
 
-async function exportArc() {
+function exportCurrentXSD() {
   if (!props.asePreview) return
   try {
     const basename = getBaseFilename(props.asePreview.path)
-    const filename = `${basename}.arc`
-
-    // For trajectories, export all frames
-    if (props.asePreview.is_trajectory) {
-      const frames = await loadAllFrames()
-      if (frames.length === 0) return
-      const content = exportTrajectoryToArc(frames, basename)
-      downloadTextFile(content, filename, 'chemical/x-arc')
-    } else {
-      // For single structure, export current frame as a single-frame trajectory
-      const frame = getCurrentFrame()
-      if (!frame) return
-      const content = exportTrajectoryToArc([frame], basename)
-      downloadTextFile(content, filename, 'chemical/x-arc')
-    }
+    const frame = getCurrentFrame()
+    if (!frame) return
+    const suffix = props.asePreview.is_trajectory ? `-frame-${frame.frame_index}` : ''
+    const content = exportToXSD(frame, basename)
+    downloadTextFile(content, `${basename}${suffix}.xsd`, 'chemical/x-xsd')
   } catch (error) {
-    console.error('Failed to export Arc:', error)
+    console.error('Failed to export current XSD:', error)
+  }
+}
+
+async function exportTrajectoryXYZ() {
+  if (!props.asePreview) return
+  try {
+    const basename = getBaseFilename(props.asePreview.path)
+    const frames = await loadAllFrames()
+    if (frames.length === 0) return
+    const content = exportTrajectoryToXYZ(frames, basename)
+    downloadTextFile(content, `${basename}.xyz`, 'chemical/x-xyz')
+  } catch (error) {
+    console.error('Failed to export trajectory XYZ:', error)
+  }
+}
+
+async function exportTrajectoryArc() {
+  if (!props.asePreview) return
+  try {
+    const basename = getBaseFilename(props.asePreview.path)
+    const frames = await loadAllFrames()
+    if (frames.length === 0) return
+    const content = exportTrajectoryToArc(frames, basename)
+    downloadTextFile(content, `${basename}.arc`, 'chemical/x-arc')
+  } catch (error) {
+    console.error('Failed to export trajectory Arc:', error)
   }
 }
 
@@ -843,7 +862,11 @@ function collectMetricSamples(key: TrajectoryMetricKey, nFrames: number) {
     }
   } else {
     const visited = new Set<number>()
+    for (const frame of variableBinaryFrameCache.values()) {
+      if (visit(frame.frame_index, frame[key])) visited.add(frame.frame_index)
+    }
     for (const frame of jsonFrameCache.values()) {
+      if (visited.has(frame.frame_index)) continue
       if (visit(frame.frame_index, frame[key])) visited.add(frame.frame_index)
     }
     const currentIndex = currentFrame.value.frame_index
@@ -958,53 +981,64 @@ async function setFrame(index: number) {
   requestedFrameIndex.value = target
   const requestVersion = ++frameLoadVersion
   if (target === currentFrame.value.frame_index) {
-    frameLoading.value = false
+    clearFrameLoading(requestVersion)
     return
   }
 
+  // Fast path: any cached frame is applied synchronously without showing the
+  // loading overlay. This avoids the mask flashing when navigating back to a
+  // frame that was already loaded.
   if (trajectoryStore && isStoreFrameAvailable(trajectoryStore, target)) {
+    clearFrameLoading(requestVersion)
     applyTrajectoryFrame(target, requestVersion)
     return
   }
-
-  if (preview.is_trajectory && canPreloadTrajectory(preview) && trajectoryStore) {
-    frameLoading.value = true
-    try {
-      await ensureChunk(target)
-      if (requestVersion !== frameLoadVersion || requestedFrameIndex.value !== target) return
-      if (trajectoryStore && isStoreFrameAvailable(trajectoryStore, target)) {
-        applyTrajectoryFrame(target, requestVersion)
-        return
-      }
-    } finally {
-      if (requestVersion === frameLoadVersion) frameLoading.value = false
+  const cachedFrame = variableBinaryFrameCache.get(target) ?? jsonFrameCache.get(target)
+  if (cachedFrame) {
+    if (requestVersion !== frameLoadVersion || requestedFrameIndex.value !== target) {
+      // Superseded before we could apply; do not touch the overlay because a
+      // newer request now owns it.
+      return
     }
-  }
-
-  if (preview.is_trajectory && !canPreloadTrajectory(preview)) {
-    frameLoading.value = true
-    try {
-      await ensureJsonChunk(target, preview)
-    } catch {
-      // Fall back to the single-frame endpoint below.
-    } finally {
-      if (requestVersion === frameLoadVersion) frameLoading.value = false
-    }
-    if (requestVersion !== frameLoadVersion || requestedFrameIndex.value !== target) return
-  }
-
-  const cached = jsonFrameCache.get(target)
-  if (cached) {
-    if (requestVersion !== frameLoadVersion || requestedFrameIndex.value !== target) return
-    currentFrame.value = cached
+    clearFrameLoading(requestVersion)
+    currentFrame.value = cachedFrame
     requestedFrameIndex.value = target
     await renderStructure(true)
     warmJsonFramesAround(target)
     return
   }
 
-  frameLoading.value = true
+  // Slow path: need an async chunk/frame fetch. Claim the overlay for this
+  // request version so only this request (or a newer one) can clear it.
+  showFrameLoading(requestVersion)
   try {
+    if (preview.is_trajectory && canUseFixedBinaryStore(preview) && trajectoryStore) {
+      await ensureChunk(target)
+    } else if (preview.is_trajectory && canUseVariableBinaryStream(preview)) {
+      await ensureVariableChunk(target, preview).catch(() => undefined)
+    } else if (preview.is_trajectory && !canUseBinaryStream(preview)) {
+      await ensureJsonChunk(target, preview).catch(() => undefined)
+    }
+
+    if (requestVersion !== frameLoadVersion || requestedFrameIndex.value !== target) return
+
+    // After the chunk has been fetched, re-check every cache the chunk could
+    // have populated. A variable binary chunk writes to variableBinaryFrameCache,
+    // a JSON chunk writes to jsonFrameCache, and a fixed binary chunk writes to
+    // the trajectory store.
+    if (trajectoryStore && isStoreFrameAvailable(trajectoryStore, target)) {
+      applyTrajectoryFrame(target, requestVersion)
+      return
+    }
+    const afterChunk = variableBinaryFrameCache.get(target) ?? jsonFrameCache.get(target)
+    if (afterChunk) {
+      currentFrame.value = afterChunk
+      requestedFrameIndex.value = target
+      await renderStructure(true)
+      warmJsonFramesAround(target)
+      return
+    }
+
     const frame = await loadFrame(target)
     if (requestVersion !== frameLoadVersion || requestedFrameIndex.value !== target) return
     currentFrame.value = frame
@@ -1013,8 +1047,33 @@ async function setFrame(index: number) {
     await renderStructure(true)
     warmJsonFramesAround(target)
   } finally {
-    if (requestVersion === frameLoadVersion) frameLoading.value = false
+    // Only the request that currently owns the overlay is allowed to clear it.
+    // A superseding request that took the fast path already cleared its own
+    // overlay; if it then started a new slow-path fetch it claimed the overlay
+    // again with a newer version, so this finally must not clobber that.
+    if (frameLoadingVersion === requestVersion) clearFrameLoading(requestVersion)
   }
+}
+
+function showFrameLoading(version: number) {
+  frameLoadingVersion = version
+  if (frameLoadingTimer !== null) {
+    window.clearTimeout(frameLoadingTimer)
+    frameLoadingTimer = null
+  }
+  frameLoadingTimer = window.setTimeout(() => {
+    frameLoadingTimer = null
+    if (frameLoadingVersion === version) frameLoading.value = true
+  }, frameLoadingDelayMs)
+}
+
+function clearFrameLoading(version: number) {
+  frameLoadingVersion = version
+  if (frameLoadingTimer !== null) {
+    window.clearTimeout(frameLoadingTimer)
+    frameLoadingTimer = null
+  }
+  frameLoading.value = false
 }
 
 function applyTrajectoryFrame(index: number, requestVersion = frameLoadVersion) {
@@ -1029,12 +1088,14 @@ function applyTrajectoryFrame(index: number, requestVersion = frameLoadVersion) 
     fmax: fmax === undefined || Number.isNaN(fmax) ? null : fmax
   }
   requestedFrameIndex.value = index
-  frameLoading.value = false
+  clearFrameLoading(requestVersion)
   chemsshViewer?.setFrame(index)
 }
 
 async function loadFrame(index: number) {
   if (!props.asePreview) return emptyFrame()
+  const variableCached = variableBinaryFrameCache.get(index)
+  if (variableCached) return variableCached
   if (trajectoryStore && isStoreFrameAvailable(trajectoryStore, index)) {
     return frameFromStore(index) ?? emptyFrame()
   }
@@ -1047,36 +1108,31 @@ async function loadFrame(index: number) {
   )
 }
 
-function canPreloadTrajectory(preview: AsePreviewResponse) {
-  return (
-    preview.transport === 'binary-available' &&
-    preview.topology_stable &&
-    estimateTrajectoryBytes(preview) <= maxLocalTrajectoryBytes
-  )
+function canUseBinaryStream(preview: AsePreviewResponse) {
+  return preview.transport === 'binary-available'
 }
 
-function estimateTrajectoryBytes(preview: AsePreviewResponse) {
-  const atomFrames = preview.n_atoms * preview.n_frames
-  return atomFrames * (3 * Float32Array.BYTES_PER_ELEMENT + Int32Array.BYTES_PER_ELEMENT + Uint8Array.BYTES_PER_ELEMENT) +
-    preview.n_frames * (9 * Float32Array.BYTES_PER_ELEMENT + 2 * Float32Array.BYTES_PER_ELEMENT)
+function canUseFixedBinaryStore(preview: AsePreviewResponse) {
+  return canUseBinaryStream(preview) && preview.topology_stable
+}
+
+function canUseVariableBinaryStream(preview: AsePreviewResponse) {
+  return canUseBinaryStream(preview) && preview.is_trajectory && !preview.topology_stable
 }
 
 function canPreloadJsonTrajectory(preview: AsePreviewResponse) {
-  return preview.is_trajectory && !canPreloadTrajectory(preview) && estimateJsonTrajectoryBytes(preview) <= maxLocalJsonTrajectoryBytes
-}
-
-function estimateJsonTrajectoryBytes(preview: AsePreviewResponse) {
-  const sampledAtoms = Math.max(preview.n_atoms, preview.frame.positions.length)
-  return sampledAtoms * preview.n_frames * 96 + preview.n_frames * 512
+  return preview.is_trajectory && !canUseBinaryStream(preview)
 }
 
 async function preloadTrajectoryFrames(version: number) {
   const preview = props.asePreview
   if (!props.active || !preview?.is_trajectory) return
-  if (canPreloadTrajectory(preview) && trajectoryStore) {
-    await preloadBinaryTrajectoryFrames(version, preview)
+
+  if (canUseBinaryStream(preview)) {
+    await streamBinaryTrajectoryFrames(version, preview)
     return
   }
+
   if (canPreloadJsonTrajectory(preview)) {
     await preloadJsonTrajectoryFrames(version, preview)
     return
@@ -1084,22 +1140,70 @@ async function preloadTrajectoryFrames(version: number) {
   warmJsonFramesAround(preview.initial_frame_index)
 }
 
-async function preloadBinaryTrajectoryFrames(version: number, preview: AsePreviewResponse) {
-  const starts = chunkStartsForFullTrajectory(preview)
-  const initialStart = Math.floor(preview.initial_frame_index / chunkSize) * chunkSize
-  starts.sort((left, right) => {
-    if (left === initialStart) return -1
-    if (right === initialStart) return 1
-    return left - right
-  })
+async function streamBinaryTrajectoryFrames(version: number, preview: AsePreviewResponse) {
+  const store = trajectoryStore  // non-null for fixed-topology
 
-  for (const start of starts) {
-    if (!props.active || version !== preloadVersion || !props.asePreview || props.asePreview.path !== preview.path) return
-    try {
-      await ensureChunkStart(start, preview, version)
-    } catch {
-      return
-    }
+  // Close any previous SSE connection.
+  closeActiveEventSource()
+
+  await new Promise<void>((resolve) => {
+    const es = streamStructureFrames(
+      preview.source,
+      preview.path,
+      (chunk) => {
+        if (version !== preloadVersion || !props.active || !props.asePreview || props.asePreview.path !== preview.path) {
+          es.close()
+          activeEventSource = null
+          resolve()
+          return
+        }
+        // Write chunk data to store (fixed) or cache (variable) immediately.
+        if (store && chunk.header.n_atoms === store.nAtoms) {
+          writeChunkToStore(chunk)
+        } else {
+          writeVariableChunkToCache(chunk)
+        }
+        updateCachedFrameCount()
+      },
+      (_nFrames) => {
+        activeEventSource = null
+        resolve()
+      },
+      (_error) => {
+        activeEventSource = null
+        // SSE failed — fall back to JSON preload if eligible.
+        if (version === preloadVersion && props.active && canPreloadJsonTrajectory(preview)) {
+          void preloadJsonTrajectoryFrames(version, preview)
+        }
+        resolve()
+      },
+      preview.format,
+      preview.size_limit_overridden === true,
+      streamChunkSize,
+    )
+
+    activeEventSource = es
+
+    // Poll for cancellation (preloadVersion bump or component inactive).
+    const check = setInterval(() => {
+      if (version !== preloadVersion || !props.active) {
+        clearInterval(check)
+        es.close()
+        activeEventSource = null
+        resolve()
+      }
+    }, 200)
+
+    // Clean up the interval when the EventSource closes naturally.
+    es.addEventListener('error', () => { clearInterval(check) })
+    es.addEventListener('done', () => { clearInterval(check) })
+  })
+}
+
+function closeActiveEventSource() {
+  if (activeEventSource) {
+    activeEventSource.close()
+    activeEventSource = null
   }
 }
 
@@ -1120,14 +1224,6 @@ async function preloadJsonTrajectoryFrames(version: number, preview: AsePreviewR
       return
     }
   }
-}
-
-function chunkStartsForFullTrajectory(preview: AsePreviewResponse) {
-  const starts: number[] = []
-  for (let start = 0; start < preview.n_frames; start += chunkSize) {
-    starts.push(start)
-  }
-  return starts
 }
 
 function jsonChunkStartsForFullTrajectory(preview: AsePreviewResponse) {
@@ -1172,6 +1268,44 @@ async function ensureChunkStart(chunkStart: number, preview: AsePreviewResponse,
   await request
 }
 
+async function ensureVariableChunk(index: number, preview: AsePreviewResponse) {
+  const chunkStart = Math.floor(index / chunkSize) * chunkSize
+  await ensureVariableChunkStart(chunkStart, preview)
+}
+
+async function ensureVariableChunkStart(chunkStart: number, preview: AsePreviewResponse, version?: number) {
+  if (isVariableChunkAvailable(chunkStart, preview)) return
+  const pending = pendingVariableChunks.get(chunkStart)
+  if (pending) {
+    await pending.promise
+    return
+  }
+  const request = readStructureFrameChunk(
+    preview.source,
+    preview.path,
+    chunkStart,
+    Math.min(chunkSize, preview.n_frames - chunkStart),
+    preview.format,
+    preview.size_limit_overridden === true
+  )
+    .then(chunk => {
+      if (version !== undefined && (version !== preloadVersion || !props.active)) return
+      if (!props.asePreview || props.asePreview.path !== preview.path) return
+      writeVariableChunkToCache(chunk)
+      updateCachedFrameCount()
+    })
+    .catch(error => {
+      // Keep JSON fallback available when a provider cannot serve variable binary.
+      void ensureJsonChunkStart(jsonChunkStartForIndex(chunkStart), preview, version).catch(() => undefined)
+      throw error
+    })
+    .finally(() => {
+      if (pendingVariableChunks.get(chunkStart)?.promise === request) pendingVariableChunks.delete(chunkStart)
+    })
+  pendingVariableChunks.set(chunkStart, { version, promise: request })
+  await request
+}
+
 async function ensureJsonChunk(index: number, preview: AsePreviewResponse) {
   await ensureJsonChunkStart(jsonChunkStartForIndex(index), preview)
 }
@@ -1209,7 +1343,7 @@ async function ensureJsonChunkStart(chunkStart: number, preview: AsePreviewRespo
 
 function warmJsonFramesAround(index: number) {
   const preview = props.asePreview
-  if (!props.active || !preview?.is_trajectory || canPreloadTrajectory(preview)) return
+  if (!props.active || !preview?.is_trajectory || canUseBinaryStream(preview)) return
   const center = jsonChunkStartForIndex(index)
   const starts: number[] = []
   for (let radius = 0; radius <= jsonWarmChunkRadius; radius += 1) {
@@ -1222,7 +1356,7 @@ function warmJsonFramesAround(index: number) {
 }
 
 function createTrajectoryStore(preview: AsePreviewResponse): TrajectoryStore | null {
-  if (!canPreloadTrajectory(preview)) return null
+  if (!canUseFixedBinaryStore(preview)) return null
   const store: TrajectoryStore = {
     nFrames: preview.n_frames,
     nAtoms: preview.n_atoms,
@@ -1298,8 +1432,23 @@ function writeChunkToStore(chunk: AseFrameChunk) {
   chemsshViewer?.setFrame(currentFrame.value.frame_index)
 }
 
+function writeVariableChunkToCache(chunk: AseFrameChunk) {
+  for (let localIndex = 0; localIndex < chunk.header.count; localIndex += 1) {
+    const frame = frameFromStructureChunk(chunk, localIndex)
+    if (frame) variableBinaryFrameCache.set(frame.frame_index, frame)
+  }
+}
+
 function updateCachedFrameCount() {
-  cachedFrameCount.value = trajectoryStore?.availableFrames?.reduce((total, value) => total + value, 0) ?? jsonFrameCache.size
+  const fixedCount = trajectoryStore?.availableFrames?.reduce((total, value) => total + value, 0)
+  if (fixedCount !== undefined) {
+    cachedFrameCount.value = fixedCount
+    return
+  }
+  const indices = new Set<number>()
+  for (const index of variableBinaryFrameCache.keys()) indices.add(index)
+  for (const index of jsonFrameCache.keys()) indices.add(index)
+  cachedFrameCount.value = indices.size
 }
 
 function cacheJsonFrame(frame: AseFrame) {
@@ -1311,6 +1460,14 @@ function isChunkAvailable(store: TrajectoryStore, chunkStart: number, preview: A
   const count = Math.min(chunkSize, preview.n_frames - chunkStart)
   for (let offset = 0; offset < count; offset += 1) {
     if (store.availableFrames?.[chunkStart + offset] !== 1) return false
+  }
+  return true
+}
+
+function isVariableChunkAvailable(chunkStart: number, preview: AsePreviewResponse) {
+  const count = Math.min(chunkSize, preview.n_frames - chunkStart)
+  for (let offset = 0; offset < count; offset += 1) {
+    if (!variableBinaryFrameCache.has(chunkStart + offset)) return false
   }
   return true
 }
@@ -1415,8 +1572,13 @@ function clampFrameIndex(index: number) {
 
 function resetAseState() {
   preloadVersion += 1
+  frameLoadVersion += 1
+  closeActiveEventSource()
+  clearFrameLoading(frameLoadVersion)
   jsonFrameCache.clear()
+  variableBinaryFrameCache.clear()
   pendingChunks.clear()
+  pendingVariableChunks.clear()
   pendingJsonChunks.clear()
   const frame = props.asePreview?.frame ?? emptyFrame()
   currentFrame.value = frame
@@ -1429,6 +1591,7 @@ function resetAseState() {
 
 function pauseTrajectoryPreload() {
   preloadVersion += 1
+  closeActiveEventSource()
 }
 
 function startTrajectoryPreload() {
@@ -1452,6 +1615,9 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  // Clean up SSE connection
+  closeActiveEventSource()
+
   // Clean up ResizeObserver
   resizeObserver?.disconnect()
   resizeObserver = null
@@ -1464,7 +1630,9 @@ onBeforeUnmount(() => {
 
   // Clean up caches to free memory
   jsonFrameCache.clear()
+  variableBinaryFrameCache.clear()
   pendingChunks.clear()
+  pendingVariableChunks.clear()
   pendingJsonChunks.clear()
 
   // Clean up trajectory store

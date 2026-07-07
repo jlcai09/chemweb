@@ -27,6 +27,7 @@ def system_info(settings: Settings = Depends(get_settings_dependency)) -> System
         python_version=platform.python_version() or sys.version.split()[0],
         scheduler=settings.scheduler.type,
         workspace_root=str(settings.workspace.root),
+        max_upload_size_mb=settings.workspace.max_upload_size_mb,
     )
 
 

@@ -94,6 +94,8 @@ async def _terminal_reader(websocket: WebSocket, session: TerminalSession, send_
             cwd = session.consume_cwd_update()
             if cwd:
                 await _send_json(websocket, send_lock, {"type": "cwd", "path": cwd})
+            for command_done in session.consume_command_done():
+                await _send_json(websocket, send_lock, command_done.to_message())
             for transfer in session.consume_transfer_requests():
                 await _send_json(websocket, send_lock, transfer.to_message())
             if data:

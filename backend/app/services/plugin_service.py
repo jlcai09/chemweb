@@ -70,6 +70,7 @@ class PluginService:
         runtime = self._runtimes.get(plugin_id)
         if runtime:
             runtime.active = True
+            self._include_plugin_router(plugin_id, runtime)
             self._call_hook(runtime.instance, "on_activate")
             return self._runtime_payload(plugin_id, manifest)
 
@@ -104,6 +105,8 @@ class PluginService:
         runtime = self._runtimes.get(plugin_id)
         if runtime:
             runtime.active = False
+            self._remove_plugin_routes(plugin_id)
+            runtime.router_loaded = False
             self._call_hook(runtime.instance, "on_deactivate")
         manifest = self._manifest(plugin_id)
         return self._runtime_payload(plugin_id, manifest, active=False)
@@ -434,6 +437,14 @@ class PluginService:
         if lib_dir.is_dir():
             candidates.extend(sorted(lib_dir.glob("python*/site-packages")))
         return candidates
+
+    def _remove_plugin_routes(self, plugin_id: str) -> None:
+        """Remove all routes registered under /api/plugins/{plugin_id}/api."""
+        prefix = f"/api/plugins/{plugin_id}/api"
+        self.app.router.routes[:] = [
+            route for route in self.app.router.routes
+            if not getattr(route, "path", "").startswith(prefix)
+        ]
 
     def _include_plugin_router(self, plugin_id: str, runtime: PluginRuntime) -> None:
         if runtime.router_loaded:

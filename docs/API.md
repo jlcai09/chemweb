@@ -68,7 +68,8 @@ security:
   "cwd": "/home/user/project",
   "python_version": "3.12.7",
   "scheduler": "slurm",
-  "workspace_root": "/home/user"
+  "workspace_root": "/home/user",
+  "max_upload_size_mb": 500
 }
 ```
 
@@ -169,6 +170,7 @@ CLI 参数：
 前端封装：`uploadFile(path, file, { relativePath, onProgress })`。文件夹上传由 `Workspace.vue` 在上传前检查当前目录顶层重名项，并按用户选择逐文件调用该接口：
 
 - 上传前会先规范化 `relative_path`：路径段中的空白字符自动替换为 `_`，然后按后端规则预检每个路径段是否只含字母、数字、点、下划线和短横线。不合规项目会在开始传输前跳过并提示，不等待后端上传失败。
+- 前端通过 `GET /api/system/info` 获取 `max_upload_size_mb`，并在上传前预检；超出限制时弹出确认对话框，用户选择继续则上传并沿用后端 413 兜底；用户选择取消则跳过该批。
 - `overwrite`：同名文件写入覆盖；同名目录只合并目录树，内部仅覆盖实际上传且同名的文件，远程额外文件保留。
 - `skip`：跳过该顶层冲突项。
 - `suffix`：把冲突顶层文件或文件夹自动改名为 `.new` 后缀，例如 `A` -> `A.new`。
@@ -349,7 +351,7 @@ Launcher 成功响应示例：
 
 ### 同步事件
 
-当 `features.open_sync_events === true` 且 `endpoints.sync_events` 存在时，`Workspace.vue` 与 `CanvasBoard.vue` 每 2 秒轮询：
+当 `features.open_sync_events === true` 且 `endpoints.sync_events` 存在时，前端由 `App.vue` 统一每 1 秒轮询：
 
 ```http
 GET /api/chemssh-bridge/open-sync-events?after=<lastSeq>
@@ -372,30 +374,94 @@ GET /api/chemssh-bridge/open-sync-events?after=<lastSeq>
 }
 ```
 
-前端维护 `lastSeq`，页面隐藏时暂停本轮请求。`status="done"` 时取 `parentDirectory(remote_path)`：工作台只在该目录等于当前目录时刷新当前列表，画板复用 `refreshFileManagersForDirectories(paths)` 刷新所有打开了该目录的文件管理窗口。`status="error"` 只弹同步失败提示，不刷新列表，避免把错误同步状态误导为远程文件已更新。
+前端维护 `lastSeq`，页面隐藏时暂停轮询，恢复可见后继续请求。`App.vue` 负责轮询并通过 store 广播事件；`Workspace.vue` 与 `CanvasBoard.vue` 只消费这些广播结果并做局部刷新。`status="done"` 时取 `parentDirectory(remote_path)`：工作台只在该目录等于当前目录时刷新当前列表，画板复用 `refreshFileManagersForDirectories(paths)` 刷新所有打开了该目录的文件管理窗口。`status="error"` 只弹同步失败提示，不刷新列表，避免把错误同步状态误导为远程文件已更新。
 
 ## 结构预览
 
 ### `GET /api/structures/ase/preview?path=/workspace/project/mol.xyz&force=false`
 
-读取结构摘要和初始帧。大文件会返回 `STRUCTURE_FILE_TOO_LARGE`，用户确认后前端可用 `force=true` 重试。
+读取结构摘要和初始帧。大文件会返回 `STRUCTURE_FILE_TOO_LARGE`，用户确认后前端可用 `force=true` 重试。`XDATCAR` 预览可先返回尾部快速解析出的最后一帧，此时 `scan_completed=false` 表示后端尚未建立完整随机访问索引；后续 `/frame`、`/frames.bin` 和 XDATCAR 的 `/frames.stream` 会要求完整 summary 并按需重扫建立索引。普通固定步长 XYZ 的 `/frames.stream` 可复用快速 summary，先按稳定帧跨度推送二进制块，避免最后一帧已显示但缓存进度延迟启动。
 
 响应包含 `warnings: string[]`，用于提示可预览但可能不完整或不适合作为结构源的情况。当前已定义：
 
 - `vasp_outcar_md_may_lack_structure`：检测到 `OUTCAR` 属于 VASP MD 任务（`IBRION = 0`）。VASP MD 轨迹通常应优先读取 `XDATCAR`；当前 `OUTCAR` 可能不包含结构轨迹信息，导致 ASE/快速解析器解析失败或只拿到有限结构块。结构预览器应在画布下方或解析失败提示附近显示红色警告，并建议用户改看 `XDATCAR`。
 - `vasp_outcar_constraints_missing` / `vasp_outcar_constraints_unreadable`：`OUTCAR` 自身不包含固定原子约束。解析器会与 ASE 一致，按同目录 `CONTCAR`、`POSCAR` 的顺序读取固定原子信息，用于 `fixed_indices` 和排除固定原子后的 `fmax`；如果没有这些文件或读取失败，结构预览器应提示当前 `Fmax` 为全部原子的 `Fmax`。
+- `XDATCAR` 自身同样不包含固定原子约束。后端快速解析器会按同目录 `CONTCAR`、`POSCAR` 的顺序读取 Selective Dynamics，并把固定原子写入每帧 `fixed_indices` 和二进制块 `fixed_mask`；缺失或不可读时沿用上述固定信息 warning。
 
 ### `GET /api/structures/ase/frame?path=/workspace/project/mol.xyz&index=0&force=false`
 
 按索引读取单帧结构。
 
-### `GET /api/structures/ase/frames.bin?path=/workspace/project/traj.xyz&start=0&count=64&force=false`
+### `GET /api/structures/ase/frames.bin?path=/workspace/project/traj.xyz&start=0&count=32&force=false`
 
 读取轨迹二进制帧块。
 
+`preview.transport` 在多帧轨迹且启用 `prefer_binary` 时返回 `binary-available`；前端据此决定是否预加载二进制帧块。拓扑稳定的轨迹走固定步长 `CWB1` 子格式，拓扑不稳定（每帧原子数或元素顺序不同）的轨迹走 `variable-atoms-v1` 子格式。
+
+二进制信封固定为：`b"CWB1"` + `<I` header 长度 + UTF-8 JSON header + 4 字节对齐 padding + 各 typed array。Header 的 `arrays` 字典记录每个数组的 `offset`、`byte_length` 和 `shape`。`dtype` 为 `float32-le`，`int_dtype` 为 `int32-le`。
+
+固定拓扑（`topology_stable=true`，无 `frame_encoding`）header 关键字段：
+
+```json
+{
+  "n_atoms": 128,
+  "topology_stable": true,
+  "symbols": ["H", "O"],
+  "numbers": [1, 8],
+  "pbc": [true, true, false],
+  "arrays": {
+    "positions": { "shape": [count, n_atoms, 3] },
+    "cells": { "shape": [count, 3, 3] },
+    "tags": { "shape": [count, n_atoms] },
+    "fixed_mask": { "shape": [count, n_atoms] },
+    "energy": { "shape": [count] },
+    "fmax": { "shape": [count] }
+  },
+  "nan_means_null": ["energy", "fmax"]
+}
+```
+
+可变拓扑（`topology_stable=false`）header 增加 `frame_encoding` 标记，并把逐帧原子数据按帧拼接：
+
+```json
+{
+  "n_atoms": 0,
+  "topology_stable": false,
+  "frame_encoding": "variable-atoms-v1",
+  "symbols": [],
+  "numbers": [],
+  "pbc": [false, false, false],
+  "arrays": {
+    "frame_atom_counts": { "shape": [count] },
+    "positions": { "shape": [total_atoms, 3] },
+    "numbers": { "shape": [total_atoms] },
+    "tags": { "shape": [total_atoms] },
+    "fixed_mask": { "shape": [total_atoms] },
+    "cells": { "shape": [count, 3, 3] },
+    "pbc": { "shape": [count, 3] },
+    "energy": { "shape": [count] },
+    "fmax": { "shape": [count] }
+  },
+  "nan_means_null": ["energy", "fmax"]
+}
+```
+
+`frame_atom_counts` 为 `int32-le`，长度等于 `count`。第 `i` 帧在拼接数组中的原子偏移为前 `i` 个 `frame_atom_counts` 的前缀和；`positions`/`numbers`/`tags`/`fixed_mask` 按帧顺序拼接。可变拓扑块额外带逐帧 `pbc`（`uint8`，0/1），因为 `.db`/`.traj` 等格式每帧 pbc 可能不同。`symbols` 在块级别为空数组，前端通过 `numbers` 推导每帧元素符号。
+
+前端封装：`frontend/src/api/structures.ts` 的 `readStructureFrameChunk()` 解析二进制信封；需要从任意二进制块取单帧时使用 `frameFromStructureChunk(chunk, localIndex)`，它同时兼容固定拓扑块和 `variable-atoms-v1` 可变拓扑块。只有调用方已确认块级 `frame_encoding === "variable-atoms-v1"` 时才直接使用 `frameFromVariableStructureChunk(chunk, localIndex)`。新增模块不要自行解析 `CWB1` 信封，统一使用这些封装。
+
 支持格式由 `backend/app/services/file_types.py` 与 ASE 能力共同决定。当前常见格式包括 `xyz`、`extxyz`、`traj`、`pdb`、`mol`、`sdf`、`cif`、`xsd`、`xtd`、`arc`、`db`，并强制识别 `POSCAR`、`CONTCAR`、`XDATCAR`、`OUTCAR` 等 VASP 文件名。
 
+XSD 周期结构会优先走后端快速解析器。解析器读取 `Atom3d XYZ` 作为分数坐标、`SpaceGroup` 的 `AVector`/`BVector`/`CVector` 作为晶胞，并把 `Atom3d RestrictedProperties="FractionalXYZ"` 或 `CompleteRestriction RestrictsObjects=... RestrictsProperties="FractionalXYZ"` 转换为 `frame.fixed_indices`。当前结构协议只表达整原子固定，不表达单轴固定。
+
 前端封装：`frontend/src/api/structures.ts`。
+
+结构预览器下载菜单支持：
+
+- 原格式：通过 `/api/files/download` 下载当前文件。
+- 当前帧 XYZ：从当前显示帧生成 XYZ/extxyz；有固定原子时写入 `fixed:I:1` 列。
+- 当前帧 XSD：从当前显示帧生成 Materials Studio XSD，保留 `RestrictedBy`、`RestrictedProperties="FractionalXYZ"` 和 `CompleteRestriction` 固定信息。
+- 整个轨迹 XYZ / Arc：仅轨迹文件显示，导出已加载或按需读取的全部帧。
 
 `frontend/src/api/structures.ts` 也提供通用 `StructureSource` 版本的读取函数。ASE 是默认数据源：
 
@@ -413,8 +479,47 @@ GET /api/chemssh-bridge/open-sync-events?after=<lastSeq>
 - `GET {apiBase}/frame`
 - `GET {apiBase}/frames`
 - `GET {apiBase}/frames.bin`
+- `GET {apiBase}/frames.stream`
 
 `frames.bin` 继续使用 `application/vnd.chemssh.structure+bin`，由现有 Brotli middleware 自动压缩。
+
+### `GET /api/structures/ase/frames.stream?path=/workspace/project/traj.xyz&chunk=32&force=false`
+
+SSE (Server-Sent Events) 长连接端点，后端持续推送二进制帧块，前端仅需一次连接即可接收所有数据，消除 N 次串行 HTTP 往返。
+
+- **Content-Type**: `text/event-stream`
+- **认证**: EventSource 不支持自定义 header，通过查询参数 `?token=xxx` 传递（`TokenAuthMiddleware` 已支持 `AUTH_QUERY_NAMES`）
+- **查询参数**:
+  - `path` (必填): 工作区相对路径
+  - `format` (可选): 文件格式
+  - `force` (可选, 默认 `false`): 跳过大文件保护
+  - `chunk` (可选, 默认 `32`, 范围 1–512): 每个事件包含的帧数
+- **响应头**:
+  - `Cache-Control: no-cache`
+  - `X-Accel-Buffering: no`（防止反向代理缓冲）
+
+SSE 事件类型：
+
+| 事件类型 | data 格式 | 说明 |
+|---------|----------|------|
+| `chunk` | base64 编码的 CWB1 二进制载荷 | 与 `/frames.bin` 返回的格式完全一致，仅多一层 base64 编码 |
+| `done` | `{"n_frames": <int>}` | 所有帧块已发送完毕 |
+| `error` | `{"code": "<str>", "message": "<str>"}` | 发生错误，可能的 code: `RESOLVE_FAILED`、`SCAN_FAILED`、`CHUNK_FAILED` |
+
+Debug 诊断事件类型仅在后端以 `--debug` 启动，或配置 `server.debug=true` / 环境变量 `CHEMSSH_DEBUG=1` 时发送。正常模式不创建 profiling dict，也不发送这些事件，以避免正式轨迹加载的额外计时和 SSE 事件开销。
+
+| 事件类型 | data 格式 | 说明 |
+|---------|----------|------|
+| `ready` | `{"t_resolve_ms": <number>, "t_scan_ms": <number>, "total_frames": <int>, "chunk_size": <int>, "server_emit_ms": <number>}` | 轨迹解析前置统计和总帧数 |
+| `meta` | `{"start": <int>, "count": <int>, "t_pack_ms": <number>, "t_b64_ms": <number>, "server_emit_ms": <number>, "size_b64": <int>, "profile": <object>}` | 紧跟在每个 `chunk` 前，包含后端打包和 profiling 明细 |
+
+后端在客户端断连时自动取消剩余块的计算（通过 `request.is_disconnected()` 轮询检测）。当客户端请求头包含 `Accept-Encoding: br` 时，BrotliMiddleware 会对 `text/event-stream` 使用 Brotli `quality=1` 做真正流式压缩：每个 SSE body chunk 经 `process()` 后立即 `flush()`，响应保留 SSE 协议但设置 `Content-Encoding: br`，不设置 `Content-Length`，避免为压缩而缓冲完整轨迹。
+
+`meta.profile` 用于开发 profiling，字段可能按实现扩展；当前包含 `read_frame_range_ms`、`build_payload_total_ms`、`normalize_frame_data_ms`、`normalize_atoms_ms`、`topology_check_ms`、`array_fill_ms`、`add_array_tobytes_ms`、`header_json_ms`、`payload_join_ms`、`payload_bytes`、`safe_count`、`read_path`、`topology`。业务前端不应依赖这些字段做渲染逻辑，开发测试页可用它们定位后端瓶颈。
+
+前端封装：`frontend/src/api/structures.ts` 的 `streamStructureFrames()` 创建 EventSource 并处理 SSE 事件，`onChunk` 回调直接调用 `parseStructureBinaryChunk()` 解码。`MoleculeViewer.vue` 的 `streamBinaryTrajectoryFrames()` 负责调度：对 `transport === 'binary-available'` 的轨迹优先走 SSE，每个 `chunk` 事件到达后立即写入 store/cache 并更新帧计数。
+
+兼容接口扩展：插件如需 SSE 推送，可注册 `GET {apiBase}/frames.stream` 端点，遵循相同的 SSE 事件协议。
 
 ## 插件
 
@@ -465,7 +570,7 @@ GET /api/chemssh-bridge/open-sync-events?after=<lastSeq>
 
 ### `POST /api/plugins/{plugin_id}/deactivate`
 
-通知插件停用。当前实现会调用插件的 `on_deactivate()` 钩子，并让前端注销该插件注册的文件预览 provider。
+通知插件停用。当前实现会移除该插件挂载在 `/api/plugins/{plugin_id}/api/*` 下的后端路由，调用插件的 `on_deactivate()` 钩子，并让前端注销该插件注册的文件预览 provider。后续再次调用 `activate` 会复用已加载的插件实例并重新挂载插件路由。
 
 ### `GET /api/plugins/{plugin_id}/dependencies`
 
@@ -675,10 +780,12 @@ WebSocket 连接使用 query 参数。启用 token 鉴权时还必须带 `token`
 - 创建终端会带上当前文件管理器目录作为 `cwd`。
 - 创建终端可传 `vim_compatibility` 布尔值，默认 `true`。前端终端设置中的“Vim 兼容模式”会保存到 `localStorage` 并随新建会话发送；关闭后只影响之后新建的终端会话。
 - 前端终端设置提供“自动复制选中文字”开关，默认关闭，保存到 `localStorage`。开启后，xterm 选区变化会把非空选中文本写入系统剪贴板；终端同时加载官方 `@xterm/addon-clipboard` 以支持 OSC 52 剪贴板访问。
+- 前端终端设置提供“同步时命令后刷新文件”开关，默认开启，保存到 client preferences 和 `localStorage` 兜底。开启后，处于 `follow` 或 `bidirectional` 同步模式的终端标签页收到命令完成事件时，会让关联文件管理器用 `listFiles(path, { refresh: true })` 绕过缓存刷新；工作台刷新左侧文件管理器，画板刷新绑定的 `file-manager` 窗口并递增该窗口的 `refreshToken`。
 - 终端工具按钮位于“新建终端”和“终端设置”之间。当前工具菜单只包含“搜索”；搜索浮窗输入内容后会扫描当前 xterm buffer，并在可见行上叠加高亮元素标记全部匹配项和当前匹配。点击“查找下一个”或“上一个”会切换当前匹配并滚动到可见区域；终端输出、滚动或点击后会重新渲染可见区域高亮。
 - 文件管理器与终端支持目录同步：`follow` 表示终端跟随文件管理器，`bidirectional` 表示终端 cwd 变化也会反向打开文件管理器目录。
 - 终端接收文件拖放时，会向当前活跃 tab 写入输入数据。当前约定是路径串前置一个空格，多个绝对路径用空格连接，例如 ` /abs/a /abs/b`。
 - 终端支持“中键粘贴当前终端选区文本”。该行为依赖宿主环境放行中键事件；常规浏览器通常会拦截为自动滚屏，自定义 WebView2 启动器可通过关闭默认中键滚轮后启用。
+- 终端启动时会清理 ChemSSH 服务进程继承来的 Python/Conda 激活状态：移除 `VIRTUAL_ENV`、`CONDA_*`、`PYTHONHOME` 以及这些环境对应的 `PATH` 片段，避免服务运行在 `.venv` 时污染 Web Terminal。清理发生在 shell 启动前；用户自己的 `/etc/profile`、`~/.bash_profile`、`~/.profile`，以及它们加载的 `.bashrc` 后续主动激活环境时不受影响，行为应与普通 SSH 登录保持一致。
 
 如果新增终端相关模块，优先通过已有 websocket 消息发送：
 
@@ -686,6 +793,16 @@ WebSocket 连接使用 query 参数。启用 token 鉴权时还必须带 `token`
 {
   "type": "input",
   "data": " ls\n"
+}
+```
+
+后端会吞掉 shell prompt 中的 ChemSSH OSC cwd 标记，并在用户通过终端输入回车后、下一次 prompt 到达时发送命令完成消息。初始 prompt 不会产生该消息。前端用它驱动同步文件管理器刷新，不应从终端显示文本中猜测命令结束：
+
+```json
+{
+  "type": "command_done",
+  "seq": 1,
+  "path": "/workspace/project"
 }
 ```
 
@@ -852,6 +969,7 @@ X-ChemSSH-Client-Id: client_xxx
 - `workspace.currentPath`：工作台当前目录。
 - `workspace.showHiddenFiles`：是否显示隐藏文件。
 - `workspace.activeWorkPanelId`：工作台右侧活跃面板。
+- `terminal.refreshFileManagerAfterCommand`：终端处于目录同步模式时，命令完成后是否刷新关联文件管理器，默认开启。
 - `logs.tailLines`：tail 行数。
 - `theme.animatedBackdrop`：是否启用全屏动态背景。
 - `theme.glassBlur`：是否启用毛玻璃背景模糊。
@@ -933,7 +1051,7 @@ X-ChemSSH-Client-Id: client_xxx
 ]
 ```
 
-终端标签页绑定到文件管理窗口后，默认进入跟随目录模式；切到双向同步时，终端 `cwd` 变化会回写对应的文件管理窗口，而不是全局工作台文件管理器。画板会用窗口标题徽标和关系线展示文件管理器、Tail、Terminal 标签页之间的绑定关系。Terminal 的大窗口按钮会把整个 TerminalPanel teleport 到 `body` 后全视口覆盖，避免被画板 transform 限制；多标签页切换、拖拽排序和标签级绑定保持不变。
+终端标签页绑定到文件管理窗口后，默认进入跟随目录模式；切到双向同步时，终端 `cwd` 变化会回写对应的文件管理窗口，而不是全局工作台文件管理器。Terminal 设置中的“同步时命令后刷新文件”开启时，`follow` 标签页命令完成后刷新当前绑定文件管理器目录，`bidirectional` 标签页命令完成后按终端最新 cwd 更新并刷新绑定文件管理器；画板通过递增对应 `file-manager` 的 `refreshToken` 触发刷新。画板会用窗口标题徽标和关系线展示文件管理器、Tail、Terminal 标签页之间的绑定关系。Terminal 的大窗口按钮会把整个 TerminalPanel teleport 到 `body` 后全视口覆盖，避免被画板 transform 限制；多标签页切换、拖拽排序和标签级绑定保持不变。
 
 ### `POST /api/client-cache/heartbeat`
 
@@ -1074,8 +1192,8 @@ function handleDrop(event: DragEvent) {
 - 文件管理器 -> 当前目录另一个文件夹：长按文件行进入内部文件拖拽后，可拖动当前选择的多个文件/文件夹到目录行。合法目标目录会高亮并以 move 光标提示；松开后先读取目标目录，若有同名项则使用和上传一致的冲突弹窗选择覆盖、跳过、添加 `.new` 后缀或取消，然后调用 `movePaths(paths, targetDirectory, entries)`，也就是 `POST /api/files/move`。文件行、空白区域、选中的目标目录、自身/子目录等非法位置不接收目录行移动 drop，保留默认禁止图标。画板文件管理窗口在内部拖拽期间还会显示当前目录悬浮投放区：一个用于移动到该窗口当前目录，另一个用于复制到该窗口当前目录。复制区使用 `copyPaths(paths, targetDirectory, entries)`，也就是 `POST /api/files/copy`；同名冲突仍使用覆盖、跳过、添加 `.new` 后缀或取消。拖到画板文件管理窗口的非目录行或空白区域时，会按移动到该窗口当前目录处理，类似 SFTP pane 级 drop 行为；目录行仍作为更精确的移动目标优先处理，复制只通过复制悬浮区触发。外部文件拖入画板文件管理窗口时显示留有少量边距的窗口级圆角“松开以上传文件”遮罩，目标目录就是该窗口当前目录，不支持直接拖拽上传到列表中的子文件夹。
 - 文件管理器 -> 终端：向当前 tab 输入 ` ${paths.join(' ')}`，不自动回车。
 - 文件管理器 -> 预览：只打开第一个路径，并切换到预览面板。
-- 预览面板统一使用结构/文本切换窗口；结构与文本子视图保活，文件管理器切换目录不会清空当前预览目标，打开普通文件时进入文本视图，只有当前目标可作为结构预览时才显示结构切换入口。结构加载和重绘期间会在旧结构上显示非阻塞半透明遮罩；继续打开下一个结构会取消上一条结构 preview 请求，并且旧响应不能覆盖新状态。预览器工具栏提供“大窗口打开”按钮，使用与 Terminal 一致的 `Teleport to="body"` 固定全页层复用当前结构或文本预览器，适合临时放大查看而不改变当前文件选择。
-- 文件管理器 -> 插件结构 provider：如果插件 UI 已加载并注册 active preview provider，文件管理器可先调用插件 `probe`，匹配成功后把插件 `StructureSource` 和文件路径发送到现有预览窗口。
+- 预览面板统一使用结构/文本切换窗口；结构与文本子视图保活，文件管理器切换目录不会清空当前预览目标，打开普通文件时进入文本视图，只有当前目标可作为结构预览时才显示结构切换入口。结构加载和重绘期间会在旧结构上显示非阻塞半透明遮罩；继续打开下一个结构会取消上一条结构 preview 请求，并且旧响应不能覆盖新状态。此竞态保护同时适用于工作台预览面板和画板预览窗口：两者都使用 `previewRequestSerial` 递增请求代号和 `AbortController` 取消未完成结构请求，旧响应返回后会检查当前 request id 是否仍是最新的，不匹配则直接丢弃。预览器工具栏提供“大窗口打开”按钮，使用与 Terminal 一致的 `Teleport to="body"` 固定全页层复用当前结构或文本预览器，适合临时放大查看而不改变当前文件选择。
+- 文件管理器 -> 插件结构 provider：如果插件 UI 已加载并注册 active preview provider，文件管理器可先调用插件 `probe`，匹配成功后把插件 `StructureSource` 和文件路径发送到现有预览窗口。画板预览窗口同样支持插件 preview provider：`CanvasPluginWindow.vue` 接管插件注册/注销消息并上报 `CanvasBoard.vue`，画板通过共享的 `previewProviders` 状态把 provider 传递给 `CanvasFileManagerWindow.vue` 和 `CanvasPreviewWindow.vue`。预览窗口打开文件时会先尝试 resolve 匹配的 provider，命中后使用 provider 的 `StructureSource` 替代默认 ASE 数据源。
 - 文件管理器图标：已加载插件注册 active preview provider 后，文件列表会用 `accepts.extensions`、`accepts.filenames`、`accepts.preview_types` 做轻量匹配；匹配到的文件显示与结构文件一致的小眼睛图标。列表渲染阶段不调用 `probe`，真实可预览性仍在双击打开时确认。
 - 文件管理器 -> 新模块：默认读取 `application/x-chemssh-files`。如果模块只需要路径，使用 `payload.paths`；如果需要判断结构/文本/目录，使用 `payload.items[*].preview_type` 和 `type`。
 - 文件管理器右键菜单：第一项复制当前选择的第一个绝对路径到剪贴板；右键未选中项时先选中该项再复制。
@@ -1088,5 +1206,7 @@ function handleDrop(event: DragEvent) {
 - 插件预览 provider 的类型与轻量匹配工具在 `frontend/src/api/filePreviewProviders.ts`；文件列表组件通过 `previewProviders` 属性接收当前 active providers。
 - 需要下载时优先使用 `downloadUrl(path)` 或 `downloadSelectionUrl(paths)`，不要硬编码接口地址。
 - 需要预览结构时，先看 `preview_type === 'structure'`，同时兼容 VASP 强制文件名。
+- VASP 强制结构文件名由后端 `file_types.py` 统一判断：`POSCAR`、`CONTCAR`、`XDATCAR`、`OUTCAR` 作为文件名片段出现时可识别为结构，并允许数字后缀或备份后缀，例如 `XDATCAR2`、`case_CONTCAR_001`、`case_xdatcar_backup`、`POSCAR.bak`。只要文件名匹配该规则，即使带 `.txt` 等文本扩展也按结构候选处理，例如 `notes_about_POSCAR.txt`。
+- VASP XML 结构预览仅对 `vasp.xml` / `vasprun.xml` 返回 `format: "vasp-xml"`；普通 `.xml` 文件按文本预览处理。
 - 大文件预览必须走确认流程，确认后才使用 `force=true`。
 - 所有路径展示可以是绝对路径；所有后端请求仍会做工作区越界校验。

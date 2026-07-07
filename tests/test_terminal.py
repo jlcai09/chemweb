@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -81,6 +84,38 @@ def test_windows_powershell_args_configure_interactive_encoding() -> None:
     assert "Set-PSReadLineOption" in args[-1]
 
 
+def test_terminal_env_drops_inherited_python_activation_state(tmp_path: Path) -> None:
+    from backend.app.providers.terminal.local_pty import _clean_inherited_terminal_env
+
+    venv = tmp_path / ".venv"
+    conda = tmp_path / "miniconda3" / "envs" / "base"
+    normal_bin = tmp_path / "bin"
+    for path in (venv / "bin", conda / "bin", normal_bin):
+        path.mkdir(parents=True)
+
+    env = _clean_inherited_terminal_env(
+        {
+            "PATH": os.pathsep.join([str(venv / "bin"), str(conda / "bin"), str(normal_bin)]),
+            "VIRTUAL_ENV": str(venv),
+            "VIRTUAL_ENV_PROMPT": "(.venv)",
+            "CONDA_PREFIX": str(conda),
+            "CONDA_DEFAULT_ENV": "base",
+            "CONDA_SHLVL": "1",
+            "PYTHONHOME": str(tmp_path / "python-home"),
+            "SHELL": "/bin/bash",
+        }
+    )
+
+    assert env["PATH"] == str(normal_bin)
+    assert "VIRTUAL_ENV" not in env
+    assert "VIRTUAL_ENV_PROMPT" not in env
+    assert "CONDA_PREFIX" not in env
+    assert "CONDA_DEFAULT_ENV" not in env
+    assert "CONDA_SHLVL" not in env
+    assert "PYTHONHOME" not in env
+    assert env["SHELL"] == "/bin/bash"
+
+
 def test_terminal_shims_include_vim_terminal_probe_workaround(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -124,6 +159,34 @@ def test_terminal_shims_skip_vim_wrappers_when_compatibility_disabled(
     assert (shim_dir / "sz").exists()
     assert not (shim_dir / "vi").exists()
     assert not (shim_dir / "vim").exists()
+
+
+def test_transfer_shim_posix_wrapper_prefers_packaged_executable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    provider = LocalPtyTerminalProvider()
+
+    def fake_mkdtemp(prefix: str) -> str:
+        path = tmp_path / prefix.rstrip("-")
+        path.mkdir()
+        return str(path)
+
+    monkeypatch.setattr("backend.app.providers.terminal.local_pty.tempfile.mkdtemp", fake_mkdtemp)
+
+    shim_dir = provider._ensure_transfer_shims()
+
+    helper = shim_dir / "_chemssh_transfer_shim.py"
+    helper_content = helper.read_text(encoding="utf-8")
+    wrapper = (shim_dir / "sz").read_text(encoding="utf-8")
+
+    assert helper_content.startswith("from __future__ import annotations\n")
+    assert "--terminal-transfer-shim 'download'" in wrapper
+    assert "_chemssh_transfer_shim.py" in wrapper
+    assert "'download' \"$@\"" in wrapper
+    assert str(Path(sys.executable)) in wrapper
+    assert "CHEMSSH_TRANSFER_PYTHON" not in wrapper
+    assert "command -v python3" not in wrapper
 
 
 def test_terminal_session_sync_cwd_validates_workspace(tmp_path: Path) -> None:
@@ -178,6 +241,89 @@ def test_terminal_session_extracts_cwd_marker_without_echo(tmp_path: Path) -> No
     assert session.cwd == str(subdir.resolve())
     assert session.consume_cwd_update() == str(subdir.resolve())
     assert session.consume_cwd_update() is None
+
+
+def test_terminal_session_emits_command_done_after_user_command(tmp_path: Path) -> None:
+    provider = FakeTerminalProvider()
+    provider.start(str(tmp_path), 24, 80)
+    created_at = utc_now()
+    session = TerminalSession(
+        session_id="term_test",
+        client_id=CLIENT_A,
+        provider=provider,
+        cwd=str(tmp_path),
+        created_at=created_at,
+        last_active_at=created_at,
+        security=WorkspaceSecurity(tmp_path),
+        allow_sync_cwd=True,
+    )
+
+    provider.read = lambda size=4096: f"\x1b]633;P;Cwd={tmp_path}\x07"  # type: ignore[method-assign]
+    assert session.read() == ""
+    assert session.consume_command_done() == []
+
+    session.write("touch result.out\r")
+    assert session.read() == ""
+    [event] = session.consume_command_done()
+
+    assert event.seq == 1
+    assert event.cwd == str(tmp_path.resolve())
+    assert event.to_message() == {"type": "command_done", "seq": 1, "path": str(tmp_path.resolve())}
+
+
+def test_terminal_session_does_not_accumulate_command_done_inside_repl(tmp_path: Path) -> None:
+    provider = FakeTerminalProvider()
+    provider.start(str(tmp_path), 24, 80)
+    created_at = utc_now()
+    session = TerminalSession(
+        session_id="term_test",
+        client_id=CLIENT_A,
+        provider=provider,
+        cwd=str(tmp_path),
+        created_at=created_at,
+        last_active_at=created_at,
+        security=WorkspaceSecurity(tmp_path),
+        allow_sync_cwd=True,
+    )
+
+    provider.read = lambda size=4096: f"\x1b]633;P;Cwd={tmp_path}\x07"  # type: ignore[method-assign]
+    assert session.read() == ""
+    assert session.consume_command_done() == []
+
+    session.write("python\r")
+    session.write("print(1)\r")
+    session.write("exit()\r")
+
+    assert session.read() == ""
+    [event] = session.consume_command_done()
+    assert event.seq == 1
+
+    assert session.read() == ""
+    assert session.consume_command_done() == []
+
+
+def test_terminal_session_emits_command_done_for_pasted_shell_commands(tmp_path: Path) -> None:
+    provider = FakeTerminalProvider()
+    provider.start(str(tmp_path), 24, 80)
+    created_at = utc_now()
+    session = TerminalSession(
+        session_id="term_test",
+        client_id=CLIENT_A,
+        provider=provider,
+        cwd=str(tmp_path),
+        created_at=created_at,
+        last_active_at=created_at,
+        security=WorkspaceSecurity(tmp_path),
+        allow_sync_cwd=True,
+    )
+
+    cwd_marker = f"\x1b]633;P;Cwd={tmp_path}\x07"
+    provider.read = lambda size=4096: f"{cwd_marker}{cwd_marker}"  # type: ignore[method-assign]
+    session.write("touch a.out\r touch b.out\n")
+
+    assert session.read() == ""
+    events = session.consume_command_done()
+    assert [event.seq for event in events] == [1, 2]
 
 
 def test_terminal_manager_enforces_session_limit(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -314,3 +460,149 @@ def test_terminal_websocket_requires_token_when_enabled(tmp_path: Path) -> None:
             pass
 
     assert exc.value.code == 1008
+
+
+# ---------------------------------------------------------------------------
+# Bidirectional cwd sync: bash --rcfile init script
+# ---------------------------------------------------------------------------
+
+
+def test_terminal_cwd_init_script_contains_expected_snippets() -> None:
+    """The embedded bash init script must emulate login profile loading, install
+    the cwd marker, and stay idempotent with env-level PROMPT_COMMAND injection."""
+    from backend.app.providers.terminal.local_pty import _CHEMSSH_CWD_INIT_SH
+
+    assert _CHEMSSH_CWD_INIT_SH
+    # Marker fragment emitted by PROMPT_COMMAND (matches backend terminal_service.py parser)
+    assert "033]633;P;Cwd=" in _CHEMSSH_CWD_INIT_SH
+    assert "PROMPT_COMMAND" in _CHEMSSH_CWD_INIT_SH
+    # Preserve login-shell behavior while allowing the marker to run after profiles
+    assert "source /etc/profile" in _CHEMSSH_CWD_INIT_SH
+    assert "${HOME}/.bash_profile" in _CHEMSSH_CWD_INIT_SH
+    assert "${HOME}/.bash_login" in _CHEMSSH_CWD_INIT_SH
+    assert "${HOME}/.profile" in _CHEMSSH_CWD_INIT_SH
+    # Idempotency: pattern guard for double-chaining the marker
+    assert '"]633;P;Cwd="*)' in _CHEMSSH_CWD_INIT_SH
+
+
+def test_local_pty_emits_cwd_init_script_into_transfer_shim_dir(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """_chemssh_cwd_init_path writes the init script next to the transfer shims and
+    reuses it on subsequent calls. terminate() must clean up the script."""
+    provider = LocalPtyTerminalProvider()
+
+    def fake_mkdtemp(prefix: str) -> str:
+        path = tmp_path / prefix.rstrip("-")
+        path.mkdir()
+        return str(path)
+
+    monkeypatch.setattr("backend.app.providers.terminal.local_pty.tempfile.mkdtemp", fake_mkdtemp)
+
+    init_path_1 = provider._chemssh_cwd_init_path()
+    init_path_2 = provider._chemssh_cwd_init_path()
+
+    assert init_path_1 == init_path_2
+    assert init_path_1.exists()
+    assert init_path_1.parent == provider._ensure_transfer_shims()
+    assert "033]633;P;Cwd=" in init_path_1.read_text(encoding="utf-8")
+
+    provider.terminate()
+    assert not init_path_1.exists()
+
+
+def test_local_pty_env_injects_prompt_command_marker_for_bash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Defense-in-depth: even before --rcfile kicks in, _terminal_env() injects the
+    bidirectional cwd marker into PROMPT_COMMAND for bash-compatible shells."""
+    monkeypatch.delenv("PROMPT_COMMAND", raising=False)
+    monkeypatch.setattr("backend.app.providers.terminal.local_pty._is_windows", lambda: False)
+
+    provider = LocalPtyTerminalProvider()
+    provider._shell = "/bin/bash"
+    env = provider._terminal_env()
+
+    assert "PROMPT_COMMAND" in env
+    assert "033]633;P;Cwd=" in env["PROMPT_COMMAND"]
+    # printf format args from the marker
+    assert "%s" in env["PROMPT_COMMAND"]
+    assert "$PWD" in env["PROMPT_COMMAND"]
+
+
+def test_local_pty_start_uses_rcfile_for_bash_shell(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Bash is launched with --rcfile <our-init-script> -i; the init script
+    emulates login profile loading and then recovers PROMPT_COMMAND."""
+    captured: dict[str, object] = {}
+
+    class FakePtyProcessUnicode:
+        @staticmethod
+        def spawn(argv, **kwargs):
+            captured["argv"] = tuple(argv)
+            captured["kwargs"] = kwargs
+            return None
+
+    monkeypatch.setitem(sys.modules, "ptyprocess", SimpleNamespace(PtyProcessUnicode=FakePtyProcessUnicode))
+    monkeypatch.setattr("backend.app.providers.terminal.local_pty._is_windows", lambda: False)
+
+    def fake_mkdtemp(prefix: str) -> str:
+        path = tmp_path / prefix.rstrip("-")
+        path.mkdir()
+        return str(path)
+
+    monkeypatch.setattr("backend.app.providers.terminal.local_pty.tempfile.mkdtemp", fake_mkdtemp)
+
+    provider = LocalPtyTerminalProvider()
+    provider.vim_compatibility = False
+    provider.start(cwd=str(tmp_path), rows=30, cols=120, shell="/bin/bash")
+
+    argv = captured["argv"]
+    assert argv[0] == "/bin/bash"
+    assert "-l" not in argv
+    assert "--rcfile" in argv
+    assert "-i" in argv
+
+    rcfile_path = Path(argv[argv.index("--rcfile") + 1])
+    assert rcfile_path.exists()
+    init_content = rcfile_path.read_text(encoding="utf-8")
+    assert "PROMPT_COMMAND" in init_content
+    assert "033]633;P;Cwd=" in init_content
+    assert "source /etc/profile" in init_content
+
+
+def test_local_pty_start_skips_rcfile_for_non_bash_shell(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Non-bash shells (e.g. zsh, fish) keep the original -l launch; --rcfile is bash-specific."""
+    captured: dict[str, object] = {}
+
+    class FakePtyProcessUnicode:
+        @staticmethod
+        def spawn(argv, **kwargs):
+            captured["argv"] = tuple(argv)
+            return None
+
+    monkeypatch.setitem(sys.modules, "ptyprocess", SimpleNamespace(PtyProcessUnicode=FakePtyProcessUnicode))
+    monkeypatch.setattr("backend.app.providers.terminal.local_pty._is_windows", lambda: False)
+
+    def fake_mkdtemp(prefix: str) -> str:
+        path = tmp_path / prefix.rstrip("-")
+        path.mkdir()
+        return str(path)
+
+    monkeypatch.setattr("backend.app.providers.terminal.local_pty.tempfile.mkdtemp", fake_mkdtemp)
+
+    provider = LocalPtyTerminalProvider()
+    provider.vim_compatibility = False
+    provider.start(cwd=str(tmp_path), rows=30, cols=120, shell="/bin/zsh")
+
+    argv = captured["argv"]
+    assert argv[0] == "/bin/zsh"
+    assert "-l" in argv
+    assert "--rcfile" not in argv

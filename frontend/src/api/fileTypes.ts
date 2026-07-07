@@ -18,14 +18,14 @@ const STRUCTURE_FALLBACK_EXTENSIONS = new Set([
   '.db',
   '.lammps',
   '.dump',
-  '.xml',
   '.gjf',
   '.com',
   '.fdf',
   '.pwi'
 ])
 
-const STRUCTURE_FALLBACK_NAMES = new Set(['xdatcar', 'outcar', 'vasp.xml'])
+const STRUCTURE_FALLBACK_NAMES = new Set(['vasp.xml', 'vasprun.xml'])
+const VASP_STRUCTURE_NAME_RE = /(^|[^A-Z0-9])(POSCAR|CONTCAR|XDATCAR|OUTCAR)(?:[0-9]+)?($|[^A-Z0-9])/
 
 export function pathBaseName(path: string) {
   return path.split(/[\\/]/).pop() ?? path
@@ -37,8 +37,7 @@ export function extensionFromName(name: string) {
 }
 
 export function isForcedStructureName(name: string) {
-  const normalized = name.toUpperCase()
-  return normalized.includes('POSCAR') || normalized.includes('CONTCAR')
+  return VASP_STRUCTURE_NAME_RE.test(name.toUpperCase())
 }
 
 export function isStructurePreviewItem(item: Pick<FileItem, 'name' | 'preview_type'>) {

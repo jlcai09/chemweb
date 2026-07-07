@@ -81,6 +81,7 @@
         :defer-init="!workspacePreferencesReady"
         :initial-bindings="workspaceTerminalBindings"
         @cwd-change="openDirectoryFromTerminal"
+        @refresh-file-manager="refreshFileManagerFromTerminal"
         @binding-summary-change="saveWorkspaceTerminalBindings"
       />
     </section>
@@ -855,6 +856,12 @@ async function openQueueWorkdir(path: string) {
 async function openDirectoryFromTerminal(path: string) {
   if (!path || path === currentPath.value) return
   await openDirectory(path)
+}
+
+async function refreshFileManagerFromTerminal(_managerId: string | null, path: string) {
+  const targetPath = workspacePathOrRoot(path || currentPath.value, systemInfo.value?.workspace_root)
+  if (!targetPath) return
+  await loadDirectory(targetPath, { refresh: true })
 }
 
 async function openPathFromInput() {

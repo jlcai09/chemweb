@@ -134,6 +134,10 @@
             <span>{{ t('terminal.autoCopySelection') }}</span>
             <el-switch v-model="autoCopySelection" size="small" />
           </label>
+          <label class="terminal-settings-toggle">
+            <span>{{ t('terminal.refreshFilesAfterCommand') }}</span>
+            <el-switch v-model="refreshFileManagerAfterCommand" size="small" />
+          </label>
           <div class="terminal-settings-submenu">
             <div class="terminal-font-size-header">
               <span style="font-weight: 700;">{{ t('terminal.fontSize') }}</span>
@@ -264,6 +268,7 @@ import { useTerminalSearch, type SearchableTab } from '../../composables/useTerm
 type TerminalMessage =
   | { type: 'output'; data: string }
   | { type: 'cwd'; path: string }
+  | { type: 'command_done'; seq: number; path: string }
   | {
       type: 'transfer_request'
       transfer_id: string
@@ -293,6 +298,7 @@ type TerminalTab = {
   interactiveReady: boolean
   awaitingVisibleShellOutput: boolean
   starting: boolean
+  exited: boolean
   terminal: Terminal | null
   clipboardAddon: ClipboardAddon | null
   fitAddon: FitAddon | null
@@ -314,9 +320,20 @@ type TerminalTab = {
   searchHighlightFrame: number
   searchHighlightTimer: number
   boundFileManagerId: string | null
+  lastRecoveryStartedAt: number
+  // Bumped every time the tab is intentionally torn down (disposeTab / closeTab).
+  // The WebSocket handlers compare against the generation they captured at open
+  // time to tell an unexpected drop (server restart, network blip) apart from a
+  // user-initiated close, so the tab can self-heal instead of staying wedged on
+  // a stale session id.
+  disposalGen: number
+  // True while a recovery attempt is in flight; prevents duplicate recovery from
+  // the same broken socket's error and close events.
+  recovering: boolean
 }
 
 const SYSTEM_CLIPBOARD_SELECTION = 'c' as ClipboardSelectionType
+const TERMINAL_RECOVERY_MIN_INTERVAL_MS = 5000
 
 const props = defineProps<{
   initialCwd?: string | null
@@ -332,6 +349,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   'cwd-change': [path: string]
   'bound-cwd-change': [managerId: string, path: string]
+  'refresh-file-manager': [managerId: string | null, path: string]
   'binding-summary-change': [summary: CanvasTerminalTabBinding[]]
 }>()
 
@@ -347,10 +365,12 @@ const {
   terminalFontSize,
   vimCompatibilityMode,
   autoCopySelection,
+  refreshFileManagerAfterCommand,
   setTerminalFontSize,
   storeTerminalFontSize,
   storeVimCompatibilityMode,
-  storeAutoCopySelection
+  storeAutoCopySelection,
+  storeRefreshFileManagerAfterCommand
 } = useTerminalSettings()
 
 const largeOpen = ref(false)
@@ -509,6 +529,10 @@ watch(autoCopySelection, value => {
   storeAutoCopySelection(value)
 })
 
+watch(refreshFileManagerAfterCommand, value => {
+  storeRefreshFileManagerAfterCommand(value)
+})
+
 watch(
   [searchTerm, searchCaseSensitive, searchRegex],
   () => {
@@ -528,6 +552,7 @@ function createEmptyTab(cwd?: string): TerminalTab {
     interactiveReady: false,
     awaitingVisibleShellOutput: false,
     starting: false,
+    exited: false,
     terminal: null,
     clipboardAddon: null,
     fitAddon: null,
@@ -548,7 +573,10 @@ function createEmptyTab(cwd?: string): TerminalTab {
     autoCopyFrame: 0,
     searchHighlightFrame: 0,
     searchHighlightTimer: 0,
-    boundFileManagerId: null
+    boundFileManagerId: null,
+    lastRecoveryStartedAt: 0,
+    disposalGen: 0,
+    recovering: false
   }
 }
 
@@ -735,14 +763,72 @@ async function startTabSession(tab: TerminalTab) {
   }
 }
 
+// Self-heal a tab whose session has become invalid (backend restart wiped the
+// in-memory store, or a stale id was replayed). Drops the stale id, asks the
+// server to delete it best-effort, then re-runs the normal session creation
+// path. `recovering` deduplicates concurrent error/close events, while
+// `lastRecoveryStartedAt` keeps a flapping backend from causing a reconnect
+// storm.
+async function recoverTabSession(tab: TerminalTab) {
+  if (tab.recovering || !tab.terminal) return
+  const staleId = tab.sessionId
+  if (!staleId) return
+  const now = Date.now()
+  if (tab.lastRecoveryStartedAt > 0 && now - tab.lastRecoveryStartedAt < TERMINAL_RECOVERY_MIN_INTERVAL_MS) {
+    pauseTabAutoRecovery(tab, staleId)
+    return
+  }
+  tab.recovering = true
+  tab.lastRecoveryStartedAt = now
+  tab.disposalGen += 1
+  closeTabSocket(tab)
+  tab.sessionId = null
+  tab.connected = false
+  tab.starting = false
+  // Best-effort: tell the server to drop the stale session. It is already gone
+  // in the restart case, so ignore any error. Await it when possible so a live
+  // stale session does not briefly count against the max-session limit.
+  try {
+    await closeTerminalSession(staleId)
+  } catch {
+    // The backend may already have dropped this session.
+  }
+  try {
+    await startTabSession(tab)
+  } finally {
+    // startTabSession flips `starting`; recovering is cleared on a successful
+    // ws.onopen. If creation failed, leave the tab recoverable by the next
+    // user action (closing/reopening the tab) rather than auto-retrying.
+    if (!tab.sessionId) tab.recovering = false
+  }
+}
+
+function pauseTabAutoRecovery(tab: TerminalTab, sessionId: string) {
+  tab.disposalGen += 1
+  closeTabSocket(tab)
+  tab.sessionId = null
+  tab.connected = false
+  tab.starting = false
+  tab.recovering = false
+  resetTabInteraction(tab)
+  tab.terminal?.writeln(`\r\n${t('terminal.reconnectPaused')}`)
+  void closeTerminalSession(sessionId).catch(() => undefined)
+}
+
 function attachTabSession(tab: TerminalTab, session: TerminalSession) {
   tab.sessionId = session.session_id
   tab.cwd = session.cwd
+  tab.exited = false
   connectTabSocket(tab, session.session_id)
 }
 
 function connectTabSocket(tab: TerminalTab, id: string) {
   closeTabSocket(tab)
+  // Snapshot the disposal generation at open time. If the WebSocket closes and
+  // this number has not advanced, the close was NOT caused by an intentional
+  // teardown (disposeTab/closeTab bump it) — it was an unexpected drop, so the
+  // session id is likely stale and should be recovered.
+  const openGen = tab.disposalGen
   let ws: WebSocket
   try {
     ws = markRaw(new WebSocket(terminalWebSocketUrl(id)))
@@ -757,6 +843,7 @@ function connectTabSocket(tab: TerminalTab, id: string) {
   ws.onopen = () => {
     if (tab.socket !== ws) return
     tab.connected = true
+    tab.recovering = false
     markTabInteractive(tab)
     void requestTabFit(tab)
     const managerPath = fileManagerPathForTab(tab)
@@ -773,6 +860,19 @@ function connectTabSocket(tab: TerminalTab, id: string) {
     if (tab.socket !== ws) return
     tab.connected = false
     resetTabInteraction(tab)
+    if (tab.recovering && tab.sessionId === id) {
+      pauseTabAutoRecovery(tab, id)
+      return
+    }
+    // Unexpected close while we still believe this session is alive: the
+    // backend most likely restarted (in-memory session store wiped) or the
+    // connection dropped. Drop the stale id and recreate the session once so
+    // the user is not left on a dead tab that only a full page reload could
+    // recover. Skipped when the close was triggered by an intentional
+    // teardown (openGen advanced) or when a recovery is already in flight.
+    if (openGen === tab.disposalGen && tab.sessionId === id && !tab.exited && !tab.recovering) {
+      void recoverTabSession(tab)
+    }
   }
 
   ws.onerror = () => {
@@ -796,13 +896,27 @@ function handleTabSocketMessage(tab: TerminalTab, raw: string) {
     if (tab.localId === activeTabId.value) scheduleSearchHighlightRefresh(tab, 50)
   } else if (message.type === 'cwd') {
     applyTabCwd(tab, message.path)
+  } else if (message.type === 'command_done') {
+    handleTabCommandDone(tab, message.path)
   } else if (message.type === 'transfer_request') {
     void handleTransferRequestComposable(tab, message)
   } else if (message.type === 'error') {
     tab.awaitingVisibleShellOutput = false
     tab.terminal.writeln(`\r\n[${message.code ?? 'ERROR'}] ${message.message ?? ''}`)
+    // The server could not find / no longer owns this session. This happens
+    // after a backend restart (in-memory session store wiped) or when a stale
+    // session id is replayed. The socket will close imminently, but to avoid
+    // racing the close handler (and because the id is provably invalid now)
+    // drop it here and recreate the session once. Without this, the tab stays
+    // wedged on the stale id — refresh and "new terminal" cannot fix it
+    // because the guard in startTabSession refuses to rebuild while a
+    // sessionId is set.
+    if (message.code === 'TERMINAL_SESSION_NOT_FOUND' && tab.sessionId && !tab.recovering) {
+      void recoverTabSession(tab)
+    }
   } else if (message.type === 'exit') {
     tab.connected = false
+    tab.exited = true
     resetTabInteraction(tab)
     tab.terminal.writeln(`\r\n${t('terminal.exited')}`)
   }
@@ -834,6 +948,10 @@ async function closeTab(tabId: string) {
 }
 
 async function disposeTab(tab: TerminalTab, closeSession: boolean) {
+  // Advance the disposal generation so any in-flight WebSocket close handler
+  // knows this teardown was intentional and suppresses the self-heal path.
+  tab.disposalGen += 1
+  tab.recovering = false
   closeTabSocket(tab)
   tab.resizeObserver?.disconnect()
   tab.inputDisposable?.dispose()
@@ -1004,6 +1122,16 @@ function applyTabCwd(tab: TerminalTab, path: string) {
   if (path === fileManagerPathForTab(tab)) return
   emitTabCwdChange(tab, path)
   emitTerminalBindingSummary()
+}
+
+function handleTabCommandDone(tab: TerminalTab, path: string) {
+  if (!refreshFileManagerAfterCommand.value || !isTabFollowingFileManager(tab)) return
+  const managerPath = fileManagerPathForTab(tab)
+  const refreshPath = tab.syncMode === 'bidirectional'
+    ? usableWorkspacePath(path || tab.cwd || managerPath)
+    : managerPath
+  if (!isUsableWorkspacePath(refreshPath)) return
+  emit('refresh-file-manager', tab.boundFileManagerId, refreshPath)
 }
 
 function markTabInteractive(tab: TerminalTab) {

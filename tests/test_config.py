@@ -65,7 +65,7 @@ def test_ase_viewer_defaults() -> None:
     assert settings.viewer.ase.max_atoms == 200_000
     assert settings.viewer.ase.max_frames == 2_000
     assert settings.viewer.ase.max_points_json == 200_000
-    assert settings.viewer.ase.binary_chunk_frames == 64
+    assert settings.viewer.ase.binary_chunk_frames == 32
 
 
 def test_brotli_yaml_accepts_on_off(tmp_path: Path) -> None:

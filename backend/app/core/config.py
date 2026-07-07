@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field, model_validator
 class ServerConfig(BaseModel):
     host: str = "127.0.0.1"
     port: int = 8888
+    debug: bool = False
     idle_shutdown_seconds: int = Field(default=0, ge=0)
     cors_origins: list[str] = Field(
         default_factory=lambda: ["http://127.0.0.1:5173", "http://localhost:5173"]
@@ -35,7 +36,7 @@ class AseViewerConfig(BaseModel):
     max_atoms: int = 200_000
     max_frames: int = 2_000
     max_points_json: int = 200_000
-    binary_chunk_frames: int = Field(default=64, ge=1, le=512)
+    binary_chunk_frames: int = Field(default=32, ge=1, le=512)
     cache_ttl_minutes: int = 30
 
 
@@ -109,6 +110,10 @@ class Settings(BaseModel):
 _settings: Optional[Settings] = None
 
 
+def _env_truthy(value: str | None) -> bool:
+    return (value or "").strip().lower() in {"1", "true", "yes", "on", "debug"}
+
+
 def _load_yaml(path: Path) -> dict[str, Any]:
     try:
         import yaml
@@ -147,6 +152,11 @@ def load_settings(
     if workspace_root or env_root:
         data.setdefault("workspace", {})
         data["workspace"]["root"] = str(workspace_root or env_root)
+
+    env_debug = os.getenv("CHEMSSH_DEBUG")
+    if env_debug is not None:
+        data.setdefault("server", {})
+        data["server"]["debug"] = _env_truthy(env_debug)
 
     settings = _normalize_settings(Settings(**data))
     set_settings(settings)
