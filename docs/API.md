@@ -582,8 +582,8 @@ Debug 诊断事件类型仅在后端以 `--debug` 启动，或配置 `server.deb
   "python": {
     "mode": "host",
     "manifest_mode": "host",
-    "python": "D:/Git/chemssh/.venv/Scripts/python.exe",
-    "requirements": "D:/Git/chemssh/plugins/cclib/backend/requirements.txt",
+    "python": "<repo-root>/.venv/Scripts/python.exe",
+    "requirements": "<repo-root>/plugins/cclib/backend/requirements.txt",
     "packages": [
       { "name": "cclib", "version": "1.8.1" }
     ],

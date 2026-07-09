@@ -34,7 +34,7 @@ Windows 用户也推荐在 Git Bash 中运行同一个脚本。
 
 ```text
 release/
-├── chemssh-0.3.5/
+├── chemssh-<version>/
 │   ├── backend/
 │   ├── frontend/
 │   │   └── dist/
@@ -44,10 +44,10 @@ release/
 │   ├── README.zh-CN.md
 │   ├── config.yaml
 │   └── pyproject.toml
-├── chemssh-0.3.5.tar.gz
-├── chemssh-0.3.5.tar.gz.sha256
-├── chemssh-0.3.5.zip
-└── chemssh-0.3.5.zip.sha256
+├── chemssh-<version>.tar.gz
+├── chemssh-<version>.tar.gz.sha256
+├── chemssh-<version>.zip
+└── chemssh-<version>.zip.sha256
 ```
 
 发行包要点：
@@ -68,10 +68,10 @@ release/
 
 ## 本地验证发行包
 
-打包后可在 `release/chemssh-{VERSION}/` 中做一次最小验证：
+打包后可在 `release/chemssh-<version>/` 中做一次最小验证：
 
 ```bash
-cd release/chemssh-0.3.5
+cd release/chemssh-<version>
 python -m venv .venv
 source .venv/bin/activate
 pip install -U pip

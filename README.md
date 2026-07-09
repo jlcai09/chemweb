@@ -14,12 +14,12 @@ ChemSSH is a local-trust tool. Run it as the user who owns the files, bind it to
 
 **Recommended for most users.**
 
-If you downloaded a release package from [GitHub Releases](https://github.com/your-username/chemssh/releases), the frontend is already built. You only need Python:
+If you downloaded a release package from [GitHub Releases](https://github.com/jlcai09/chemssh/releases), the frontend is already built. You only need Python:
 
 ```bash
 # 1. Extract the release package
-tar -xzf chemssh-0.3.4.tar.gz
-cd chemssh-0.3.4
+tar -xzf chemssh-<version>.tar.gz
+cd chemssh-<version>
 
 # 2. Create Python virtual environment and install
 python -m venv .venv
@@ -88,47 +88,47 @@ Common options:
 
 ```yaml
 server:
-  host: 127.0.0.1
-  port: 8888
-  idle_shutdown_seconds: 3600
+  host: 127.0.0.1              # Bind address; keep 127.0.0.1 for local/SSH-tunnel-only access. Use a trusted address and enable token before exposing publicly
+  port: 8888                   # HTTP and WebSocket service port
+  idle_shutdown_seconds: 3600 # Auto-shutdown after this many seconds of inactivity; 0 disables auto-shutdown
 
 workspace:
-  root: .
-  allow_delete: true
-  max_upload_size_mb: 500
-  max_read_size_mb: 5
+  root: .                      # Workspace root; all file reads/writes/uploads/downloads/previews/terminal/job submissions are confined here (override via CHEMSSH_WORKSPACE or --workspace-root)
+  allow_delete: true           # Whether the frontend may delete files/directories
+  max_upload_size_mb: 500      # Maximum size for a single uploaded file (MB)
+  max_read_size_mb: 5          # Maximum file size loaded for preview/read (MB); larger files require confirmation
 
 scheduler:
-  type: slurm        # slurm or pbs
-  refresh_interval: 10
+  type: slurm                  # Job scheduler type: slurm or pbs
+  refresh_interval: 10         # Queue status polling interval (seconds)
 
 viewer:
-  max_file_size_mb: 50
+  max_file_size_mb: 50         # Maximum file size that can be opened in the structure previewer (MB)
   ase:
-    enabled: true
-    prefer_binary: true
-    max_atoms: 200000
-    max_frames: 5000
-    binary_chunk_frames: 32
+    enabled: true             # Whether to enable ASE structure parsing and preview
+    prefer_binary: true       # Prefer binary frame chunks for better performance on large structures/long trajectories
+    max_atoms: 200000         # Maximum atoms per frame; preview is rejected beyond this
+    max_frames: 5000          # Maximum number of frames loaded; excess is truncated
+    binary_chunk_frames: 32   # Number of frames per chunk in binary streaming
 
 terminal:
-  enabled: true
-  shell: null
-  max_sessions: 10  # per browser client_id
-  allow_sync_cwd: true
+  enabled: true               # Whether to enable the built-in terminal
+  shell: null                 # Login shell to use (e.g. /bin/bash); null uses the system default shell
+  max_sessions: 10            # Maximum terminal sessions per browser client_id
+  allow_sync_cwd: true        # Whether the terminal may sync its working directory with the file manager
 
 security:
-  enable_token: false
-  token: change-me
+  enable_token: false         # Whether to require token auth for all /api HTTP requests and /api WebSocket connections
+  token: change-me            # Auth token; replace with a long random string and change it before exposing the service
 
 plugins:
-  enabled: true
-  directories: []
+  enabled: true               # Whether to enable the plugin system
+  directories: []             # Extra plugin directories; when empty only built-in/bundled plugins are loaded
 
 client_cache:
-  enabled: true
-  directory: null
-  cleanup_offline_days: 14
+  enabled: true               # Whether to enable browser-side cache (preferences, canvas layouts, etc.)
+  directory: null             # Server-side cache directory; null uses the default location
+  cleanup_offline_days: 14    # Client caches offline longer than this many days are cleaned up
 ```
 
 `CHEMSSH_WORKSPACE` or `chemssh --workspace-root ...` can override `workspace.root`.

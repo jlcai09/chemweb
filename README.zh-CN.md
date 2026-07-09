@@ -14,12 +14,12 @@ ChemSSH 是本地信任模型工具。请用拥有目标文件的用户运行，
 
 **推荐大多数用户使用。**
 
-如果你从 [GitHub Releases](https://github.com/your-username/chemssh/releases) 下载了发行版，前端已经构建好了，只需要 Python：
+如果你从 [GitHub Releases](https://github.com/jlcai09/chemssh/releases) 下载了发行版，前端已经构建好了，只需要 Python：
 
 ```bash
 # 1. 解压发行版
-tar -xzf chemssh-0.3.4.tar.gz
-cd chemssh-0.3.4
+tar -xzf chemssh-<version>.tar.gz
+cd chemssh-<version>
 
 # 2. 创建 Python 虚拟环境并安装
 python -m venv .venv
@@ -88,47 +88,47 @@ workspace:
 
 ```yaml
 server:
-  host: 127.0.0.1
-  port: 8888
-  idle_shutdown_seconds: 3600
+  host: 127.0.0.1              # 监听地址；保持 127.0.0.1 仅本机/SSH 隧道可访问，暴露到公网前请改用可信地址并启用 token
+  port: 8888                   # HTTP 与 WebSocket 服务端口
+  idle_shutdown_seconds: 3600 # 无活动后自动关闭服务的秒数；0 表示永不自动关闭
 
 workspace:
-  root: .
-  allow_delete: true
-  max_upload_size_mb: 500
-  max_read_size_mb: 5
+  root: .                      # 工作区根目录，所有文件读写/上传/下载/预览/终端/作业提交都被限制在此目录内（可用 CHEMSSH_WORKSPACE 或 --workspace-root 覆盖）
+  allow_delete: true           # 是否允许前端删除文件/目录
+  max_upload_size_mb: 500      # 单次上传文件大小上限（MB）
+  max_read_size_mb: 5          # 预览/读取时允许加载的最大文件体积（MB），超过需用户确认
 
 scheduler:
-  type: slurm        # slurm 或 pbs
-  refresh_interval: 10
+  type: slurm                  # 作业调度系统类型：slurm 或 pbs
+  refresh_interval: 10         # 队列状态轮询刷新间隔（秒）
 
 viewer:
-  max_file_size_mb: 50
+  max_file_size_mb: 50         # 可在结构预览器中打开的文件大小上限（MB）
   ase:
-    enabled: true
-    prefer_binary: true
-    max_atoms: 200000
-    max_frames: 5000
-    binary_chunk_frames: 32
+    enabled: true             # 是否启用 ASE 结构解析与预览
+    prefer_binary: true       # 优先使用二进制帧块传输，提升大结构/长轨迹性能
+    max_atoms: 200000         # 单帧允许的最大原子数，超过则拒绝预览
+    max_frames: 5000          # 允许加载的最大帧数，超过将被截断
+    binary_chunk_frames: 32   # 二进制流式传输时每块包含的帧数
 
 terminal:
-  enabled: true
-  shell: null
-  max_sessions: 10  # 每个浏览器 client_id 的限制
-  allow_sync_cwd: true
+  enabled: true               # 是否启用内置终端
+  shell: null                 # 指定登录 shell（如 /bin/bash）；null 表示使用系统默认 shell
+  max_sessions: 10            # 单个浏览器 client_id 允许的最大终端会话数
+  allow_sync_cwd: true        # 是否允许终端与文件管理器同步当前工作目录
 
 security:
-  enable_token: false
-  token: change-me
+  enable_token: false         # 是否对所有 /api HTTP 请求与 /api WebSocket 连接启用 token 鉴权
+  token: change-me            # 鉴权 token；启用后请替换为长随机字符串，暴露服务前务必修改
 
 plugins:
-  enabled: true
-  directories: []
+  enabled: true               # 是否启用插件系统
+  directories: []             # 额外插件目录列表；为空时仅加载内置/打包插件
 
 client_cache:
-  enabled: true
-  directory: null
-  cleanup_offline_days: 14
+  enabled: true               # 是否启用浏览器端缓存（偏好、画板布局等）
+  directory: null             # 服务端缓存目录；null 表示使用默认目录
+  cleanup_offline_days: 14    # 离线超过该天数的客户端缓存将被清理
 ```
 
 也可以用 `CHEMSSH_WORKSPACE` 或 `chemssh --workspace-root ...` 覆盖 `workspace.root`。
